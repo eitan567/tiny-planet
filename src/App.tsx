@@ -68,7 +68,7 @@ export default function App() {
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const planetRef = useRef<THREE.Group | null>(null);
   const cloudsRef = useRef<THREE.Group | null>(null);
@@ -94,8 +94,18 @@ export default function App() {
     const scene = new THREE.Scene();
     sceneRef.current = scene;
     
-    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(0, 6, 12);
+    // Orthographic Camera completely eliminates perspective/fisheye distortion
+    const aspect = window.innerWidth / window.innerHeight;
+    const frustumSize = 18;
+    const camera = new THREE.OrthographicCamera(
+      frustumSize * aspect / -2,
+      frustumSize * aspect / 2,
+      frustumSize / 2,
+      frustumSize / -2,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 6, 18);
     cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -210,8 +220,8 @@ export default function App() {
     planetGroup.add(water);
 
     // --- Atmosphere Glow ---
-    // Expanded radius so the airplane (radius ~6.2) is fully inside
-    const atmosGeo = new THREE.SphereGeometry(PLANET_RADIUS * 1.6, 64, 64);
+    // Expanded radius so the airplane (radius Planet + 1.2 = 6.2) is fully inside but not too far out
+    const atmosGeo = new THREE.SphereGeometry(PLANET_RADIUS * 1.3, 64, 64);
     const atmosMat = new THREE.MeshBasicMaterial({
       color: 0x4aa6ff,
       transparent: true,
@@ -531,11 +541,11 @@ export default function App() {
 
     // --- Starfield ---
     const starGeometry = new THREE.BufferGeometry();
-    const starCount = 8000;
+    const starCount = 15000;
     const starPositions = new Float32Array(starCount * 3);
     for (let i = 0; i < starCount * 3; i += 3) {
-      // Create stars in a large shell around the scene
-      const r = 200 + Math.random() * 300;
+      // Create stars within the orthographic view bounds
+      const r = 40 + Math.random() * 60;
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.acos(2 * Math.random() - 1);
       starPositions[i] = r * Math.sin(phi) * Math.cos(theta);
@@ -545,8 +555,8 @@ export default function App() {
     starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
     const starMaterial = new THREE.PointsMaterial({
       color: 0xffffff,
-      size: 0.8,
-      sizeAttenuation: true,
+      size: 1.5, // Fixed pixel size on screen for orthographic projection
+      sizeAttenuation: false, // Orthographic camera doesn't use distance for sizing
       transparent: true,
       opacity: 0.5, // Static opacity
     });
@@ -596,10 +606,7 @@ export default function App() {
         });
       }
 
-      if (starfieldRef.current) {
-        starfieldRef.current.rotation.y += 0.0002;
-        starfieldRef.current.rotation.z += 0.0001;
-      }
+      // (Disabled starfield rotation per user request)
 
       controls.update();
 
@@ -680,8 +687,16 @@ export default function App() {
     animate();
 
     const handleResize = () => {
-      camera.aspect = window.innerWidth / window.innerHeight;
-      camera.updateProjectionMatrix();
+      const aspect = window.innerWidth / window.innerHeight;
+      const frustumSize = 18;
+      
+      const orthoCam = camera as THREE.OrthographicCamera;
+      orthoCam.left = -frustumSize * aspect / 2;
+      orthoCam.right = frustumSize * aspect / 2;
+      orthoCam.top = frustumSize / 2;
+      orthoCam.bottom = -frustumSize / 2;
+      
+      orthoCam.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
     };
     window.addEventListener('resize', handleResize);
@@ -697,7 +712,7 @@ export default function App() {
 
   // --- Weather Logic ---
   useEffect(() => {
-    if (!sceneRef.current || !cloudsRef.current) return;
+    if (!sceneRef.current || !cloudsRef.current || !sunLightRef.current) return;
 
     // Clean up previous weather particles
     if (weatherParticlesRef.current) {
@@ -720,6 +735,9 @@ export default function App() {
     stormCloudsRef.current = [];
 
     if (weather === 'clear' || weather === 'windy') {
+      // Restore sun light intensity
+      sunLightRef.current.intensity = 2.5;
+
       // Restore base cloud colors
       cloudsRef.current.children.forEach(cloud => {
         cloud.traverse(child => {
@@ -752,6 +770,9 @@ export default function App() {
     }
 
     // --- Rain or Snow: darken existing clouds and add storm clouds ---
+    // Dim sun light intensity to simulate heavy cloud cover blocking the sun
+    sunLightRef.current.intensity = 1.0;
+
     const stormColor = weather === 'rain' ? 0x777788 : 0xccccdd;
     const stormOpacity = weather === 'rain' ? 0.95 : 0.9;
 
@@ -960,33 +981,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Atmospheric Overlays */}
-      <AnimatePresence>
-        {weather === 'rain' && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 0.4 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-blue-950/30 pointer-events-none z-0 backdrop-blur-[2px]"
-          />
-        )}
-        {weather === 'snow' && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 0.2 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-white/20 pointer-events-none z-0 backdrop-blur-[1px]"
-          />
-        )}
-        {weather === 'windy' && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 0.1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-slate-200/10 pointer-events-none z-0 backdrop-blur-[0.5px]"
-          />
-        )}
-      </AnimatePresence>
     </div>
   );
 }
