@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Sun, Moon, CloudRain, Snowflake, Wind, Cloud, Play, Pause, Volume2, VolumeX } from 'lucide-react';
+import { Sun, CloudRain, Snowflake, Wind, Volume2, VolumeX, RotateCcw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 // --- Types ---
@@ -16,19 +16,24 @@ const WATER_LEVEL = 0.998; // Relative to PLANET_RADIUS
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [isDay, setIsDay] = useState(true);
   const [weather, setWeather] = useState<Weather>('clear');
   const [isRotating, setIsRotating] = useState(true);
   const [isMuted, setIsMuted] = useState(true);
   const [volume, setVolume] = useState(0.3);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // High-quality organic nature sounds
+  // Refs to track latest state inside the animation loop (avoids stale closures)
+  const isRotatingRef = useRef(isRotating);
+  const weatherRef = useRef(weather);
+  useEffect(() => { isRotatingRef.current = isRotating; }, [isRotating]);
+  useEffect(() => { weatherRef.current = weather; }, [weather]);
+
+  // Ambient nature sounds (local files)
   const weatherSounds: Record<Weather, string> = {
-    clear: 'https://cdn.pixabay.com/audio/2022/01/18/audio_8033696564.mp3', // Summer forest with birds
-    rain: 'https://cdn.pixabay.com/audio/2021/08/09/audio_88447e969f.mp3',  // Soft rain and nature
-    snow: 'https://cdn.pixabay.com/audio/2022/02/07/audio_67894f0631.mp3',  // Gentle winter wind
-    windy: 'https://cdn.pixabay.com/audio/2022/02/07/audio_67894f0631.mp3', // Gentle winter wind
+    clear: '/audio/forest-birds.mp3', // Forest with birds
+    rain: '/audio/rain.mp3',          // Soft rain
+    snow: '/audio/wind.mp3',          // Gentle winter wind
+    windy: '/audio/wind.mp3',         // Wind
   };
 
   useEffect(() => {
@@ -76,6 +81,11 @@ export default function App() {
   const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
   const sunLightRef = useRef<THREE.DirectionalLight | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
+  const stormCloudsRef = useRef<THREE.Group[]>([]);
+  const particleCloudMapRef = useRef<Int16Array>(new Int16Array(0)); // particle index → cloud child index
+  const particleFallProgressRef = useRef<Float32Array>(new Float32Array(0)); // 0 = at cloud, 1 = at surface
+  const particleOffsetRef = useRef<Float32Array>(new Float32Array(0)); // [latX, latZ, latX, latZ...]
+  const celestialGroupRef = useRef<THREE.Group | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -199,13 +209,35 @@ export default function App() {
     const water = new THREE.Mesh(waterGeo, waterMat);
     planetGroup.add(water);
 
+    // --- Atmosphere Glow ---
+    // Expanded radius so the airplane (radius ~6.2) is fully inside
+    const atmosGeo = new THREE.SphereGeometry(PLANET_RADIUS * 1.6, 64, 64);
+    const atmosMat = new THREE.MeshBasicMaterial({
+      color: 0x4aa6ff,
+      transparent: true,
+      opacity: 0.1,
+      blending: THREE.AdditiveBlending,
+      side: THREE.BackSide, // BackSide helps create a rim-glow effect from the outside
+      depthWrite: false
+    });
+    const atmosphere = new THREE.Mesh(atmosGeo, atmosMat);
+    planetGroup.add(atmosphere);
+
     // --- Objects ---
-    const windowMat = new THREE.MeshStandardMaterial({ 
+    const windowMatNight = new THREE.MeshStandardMaterial({ 
       color: 0x111111,
       emissive: 0xffaa00,
-      emissiveIntensity: isDay ? 0 : 2
+      emissiveIntensity: 2 // Emit light on the dark side
     });
-    houseWindowMaterialRef.current = windowMat;
+    const windowMatDay = new THREE.MeshStandardMaterial({ 
+      color: 0x111111,
+      emissive: 0xffaa00,
+      emissiveIntensity: 0 // No light on the day side
+    });
+    houseWindowMaterialRef.current = windowMatNight; // For any backward compatibility check, though not strictly needed anymore
+
+    // Direction the sun is located
+    const sunDir = new THREE.Vector3(10, 15, 10).normalize();
 
     const addTree = (pos: THREE.Vector3) => {
       // Adjust position to terrain height
@@ -265,8 +297,13 @@ export default function App() {
 
       // Windows
       const windowGeo = new THREE.PlaneGeometry(0.08, 0.08);
+      
+      // Determine if house is on day or night side
+      const isDaySide = direction.dot(sunDir) > -0.1; // Slightly offset to capture twilight
+      const activeWindowMat = isDaySide ? windowMatDay : windowMatNight;
+
       for (let i = 0; i < 4; i++) {
-        const windowMesh = new THREE.Mesh(windowGeo, windowMat);
+        const windowMesh = new THREE.Mesh(windowGeo, activeWindowMat);
         const offset = 0.151;
         if (i === 0) {
           windowMesh.position.set(0, 0.15, offset);
@@ -308,29 +345,39 @@ export default function App() {
     scene.add(cloudsGroup);
     cloudsRef.current = cloudsGroup;
 
-    for (let i = 0; i < CLOUD_COUNT; i++) {
+    const createCloud = (color: number, opacity: number, scale: number) => {
       const cloud = new THREE.Group();
       const cloudGeo = new THREE.SphereGeometry(0.3, 12, 12);
       const cloudMat = new THREE.MeshStandardMaterial({ 
-        color: 0xffffff, 
+        color, 
         transparent: true, 
-        opacity: 0.9 
+        opacity 
       });
       
-      for (let j = 0; j < 4; j++) {
+      const partCount = 3 + Math.floor(Math.random() * 4); // 3-6 parts
+      for (let j = 0; j < partCount; j++) {
         const part = new THREE.Mesh(cloudGeo, cloudMat);
-        part.position.x = (j - 1.5) * 0.25;
-        part.position.y = Math.sin(j) * 0.1;
-        part.scale.set(1 - Math.abs(j - 1.5) * 0.3, 1 - Math.abs(j - 1.5) * 0.3, 1 - Math.abs(j - 1.5) * 0.3);
+        part.position.x = (j - partCount / 2) * 0.22;
+        part.position.y = Math.sin(j * 0.8) * 0.08;
+        part.position.z = (Math.random() - 0.5) * 0.15;
+        const s = (0.6 + Math.random() * 0.5) * scale;
+        part.scale.set(s, s * 0.7, s);
         cloud.add(part);
       }
+      return cloud;
+    };
 
-      const radius = PLANET_RADIUS + 2.0 + Math.random() * 2;
+    const baseCloudPositions: THREE.Vector3[] = [];
+    for (let i = 0; i < CLOUD_COUNT; i++) {
+      const cloud = createCloud(0xffffff, 0.9, 1.0);
+      // Restrict clouds to a narrow, realistic altitude band
+      const radius = PLANET_RADIUS + 1.2 + Math.random() * 0.2;
       const phi = Math.random() * Math.PI;
       const theta = Math.random() * Math.PI * 2;
       cloud.position.setFromSphericalCoords(radius, phi, theta);
       cloud.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), cloud.position.clone().normalize());
       cloudsGroup.add(cloud);
+      baseCloudPositions.push(cloud.position.clone());
     }
 
     // --- Airplane ---
@@ -423,18 +470,64 @@ export default function App() {
     }
     birdPivotsRef.current = birdPivots;
 
-    // --- Lights ---
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+    // --- Celestial Bodies & Lights ---
+    // Create a group that we can rotate for the day/night cycle
+    const celestialGroup = new THREE.Group();
+    scene.add(celestialGroup);
+    celestialGroupRef.current = celestialGroup;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.05); // Very dim ambient moonlight
     scene.add(ambientLight);
     ambientLightRef.current = ambientLight;
 
-    const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
-    sunLight.position.set(10, 15, 10);
+    // Sun target position
+    const lightDistance = 40;
+    const sunPos = new THREE.Vector3(10, 15, 10).normalize().multiplyScalar(lightDistance);
+
+    const sunLight = new THREE.DirectionalLight(0xffffff, 2.5); // Much brighter sun for stark contrast
+    sunLight.position.copy(sunPos);
     sunLight.castShadow = true;
     sunLight.shadow.mapSize.width = 1024;
     sunLight.shadow.mapSize.height = 1024;
-    scene.add(sunLight);
+    celestialGroup.add(sunLight);
     sunLightRef.current = sunLight;
+
+    // Visual Sun Mesh
+    const sunGeo = new THREE.SphereGeometry(2, 32, 32);
+    const sunMat = new THREE.MeshBasicMaterial({ 
+      color: 0xffffee,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending
+    });
+    const sunMesh = new THREE.Mesh(sunGeo, sunMat);
+    sunMesh.position.copy(sunPos);
+    
+    // Core of the sun (brighter)
+    const sunCore = new THREE.Mesh(
+      new THREE.SphereGeometry(1.5, 32, 32),
+      new THREE.MeshBasicMaterial({ color: 0xffffff })
+    );
+    sunMesh.add(sunCore);
+    celestialGroup.add(sunMesh);
+
+    // Visual Moon Mesh (opposite the sun)
+    const moonPos = sunPos.clone().multiplyScalar(-1);
+    const moonGeo = new THREE.SphereGeometry(1.4, 32, 32);
+    const moonMat = new THREE.MeshStandardMaterial({
+      color: 0xdddddd,
+      roughness: 0.8,
+      metalness: 0.1,
+      emissive: 0x444455,
+      emissiveIntensity: 0.4
+    });
+    const moonMesh = new THREE.Mesh(moonGeo, moonMat);
+    moonMesh.position.copy(moonPos);
+    celestialGroup.add(moonMesh);
+
+    // Set a static rotation or let celestialGroup stay at default
+    // We remove dynamic day/night rotation since the planet itself has a light and dark side now
+    celestialGroup.rotation.y = 0;
 
     // --- Starfield ---
     const starGeometry = new THREE.BufferGeometry();
@@ -455,7 +548,7 @@ export default function App() {
       size: 0.8,
       sizeAttenuation: true,
       transparent: true,
-      opacity: isDay ? 0.1 : 0.8,
+      opacity: 0.5, // Static opacity
     });
     const starField = new THREE.Points(starGeometry, starMaterial);
     scene.add(starField);
@@ -466,12 +559,12 @@ export default function App() {
     const animate = () => {
       frameId = requestAnimationFrame(animate);
       
-      if (isRotating && planetRef.current) {
+      if (isRotatingRef.current && planetRef.current) {
         planetRef.current.rotation.y += 0.003;
         cloudsRef.current!.rotation.y += 0.002;
       }
 
-      if (isRotating && airplanePivotRef.current && airplaneTiltRef.current) {
+      if (isRotatingRef.current && airplanePivotRef.current && airplaneTiltRef.current) {
         airplanePivotRef.current.rotation.y += 0.008;
         airplaneTiltRef.current.rotation.x += 0.0005;
         airplaneTiltRef.current.rotation.z += 0.0003;
@@ -483,7 +576,7 @@ export default function App() {
         }
       }
 
-      if (isRotating && birdPivotsRef.current) {
+      if (isRotatingRef.current && birdPivotsRef.current) {
         const time = Date.now() * 0.01;
         birdPivotsRef.current.forEach((pivot, index) => {
           pivot.rotation.y += 0.004 + index * 0.0005;
@@ -510,21 +603,73 @@ export default function App() {
 
       controls.update();
 
-      // Weather animation
-      if (weatherParticlesRef.current) {
+      // Weather animation - each particle is bound to its parent cloud
+      if (weatherParticlesRef.current && cloudsRef.current) {
+        const w = weatherRef.current;
         const positions = weatherParticlesRef.current.geometry.attributes.position.array as Float32Array;
-        for (let i = 0; i < positions.length; i += 3) {
-          if (weather === 'rain') {
-            positions[i + 1] -= 0.6;
-            if (positions[i + 1] < -20) positions[i + 1] = 20;
-          } else if (weather === 'snow') {
-            positions[i + 1] -= 0.1;
-            positions[i] += Math.sin(Date.now() * 0.001 + i) * 0.04;
-            if (positions[i + 1] < -20) positions[i + 1] = 20;
-          } else if (weather === 'windy') {
-             positions[i] += 0.8;
-             positions[i + 1] += Math.sin(Date.now() * 0.002 + i) * 0.1;
-             if (positions[i] > 25) positions[i] = -25;
+        const cloudMap = particleCloudMapRef.current;
+        const fallProgress = particleFallProgressRef.current;
+        const clouds = cloudsRef.current.children;
+        const cloudWorldPos = new THREE.Vector3();
+        const surfaceRadius = PLANET_RADIUS + 0.15;
+
+        if (w === 'windy') {
+          // Windy: simple horizontal movement
+          for (let i = 0; i < positions.length; i += 3) {
+            positions[i] += 0.8;
+            positions[i + 1] += Math.sin(Date.now() * 0.002 + i) * 0.1;
+            if (positions[i] > 25) positions[i] = -25;
+          }
+        } else if (cloudMap.length > 0 && fallProgress.length > 0) {
+          // Rain/Snow: particles track their parent cloud
+          const fallSpeed = w === 'rain' ? 0.004 : 0.0015;
+          const particleCount = cloudMap.length;
+
+          for (let pi = 0; pi < particleCount; pi++) {
+            const ci = cloudMap[pi];
+            if (ci < 0 || ci >= clouds.length) continue;
+
+            // Get this cloud's current world position (accounts for rotation)
+            clouds[ci].getWorldPosition(cloudWorldPos);
+            const cloudDist = cloudWorldPos.length();
+            const dir = cloudWorldPos.clone().normalize();
+
+            // Advance fall progress
+            fallProgress[pi] += fallSpeed + Math.random() * fallSpeed * 0.5;
+            if (fallProgress[pi] >= 1.0) {
+              fallProgress[pi] = Math.random() * 0.05; // reset to top of cloud
+            }
+
+            // Interpolate: cloud position → surface along inward direction
+            const t = fallProgress[pi];
+            const currentRadius = cloudDist * (1 - t) + surfaceRadius * t;
+
+            // Read pre-generated random lateral offsets for this particle
+            const offsets = particleOffsetRef.current;
+            const lateralX = offsets[pi * 2];
+            const lateralZ = offsets[pi * 2 + 1];
+
+            // Find perpendicular vectors to the inward direction
+            const perp1 = new THREE.Vector3(-dir.z, 0, dir.x);
+            if (perp1.lengthSq() < 0.001) perp1.set(0, 0, 1);
+            perp1.normalize();
+            const perp2 = new THREE.Vector3().crossVectors(dir, perp1).normalize();
+
+            // Snow: slight additional swirl during fall
+            let swirlX = 0, swirlZ = 0;
+            if (w === 'snow') {
+              const seed = pi * 3.7;
+              swirlX = Math.sin(Date.now() * 0.0005 + seed) * 0.08 * t;
+              swirlZ = Math.cos(Date.now() * 0.0004 + seed * 1.3) * 0.08 * t;
+            }
+
+            const px = dir.x * currentRadius + perp1.x * (lateralX + swirlX) + perp2.x * (lateralZ + swirlZ);
+            const py = dir.y * currentRadius + perp1.y * (lateralX + swirlX) + perp2.y * (lateralZ + swirlZ);
+            const pz = dir.z * currentRadius + perp1.z * (lateralX + swirlX) + perp2.z * (lateralZ + swirlZ);
+
+            positions[pi * 3] = px;
+            positions[pi * 3 + 1] = py;
+            positions[pi * 3 + 2] = pz;
           }
         }
         weatherParticlesRef.current.geometry.attributes.position.needsUpdate = true;
@@ -545,35 +690,16 @@ export default function App() {
       window.removeEventListener('resize', handleResize);
       cancelAnimationFrame(frameId);
       renderer.dispose();
-      if (containerRef.current) {
-        containerRef.current.removeChild(renderer.domElement);
-      }
+      renderer.domElement.remove();
     };
-  }, [isRotating, weather]);
-
-  // --- Day/Night Logic ---
-  useEffect(() => {
-    if (!sceneRef.current || !ambientLightRef.current || !sunLightRef.current) return;
-
-    if (isDay) {
-      ambientLightRef.current.intensity = 0.8;
-      sunLightRef.current.intensity = 1.2;
-      sunLightRef.current.color.setHex(0xffffff);
-      if (starfieldRef.current) (starfieldRef.current.material as THREE.PointsMaterial).opacity = 0.1;
-      if (houseWindowMaterialRef.current) houseWindowMaterialRef.current.emissiveIntensity = 0;
-    } else {
-      ambientLightRef.current.intensity = 0.2;
-      sunLightRef.current.intensity = 0.3;
-      sunLightRef.current.color.setHex(0x5555ff);
-      if (starfieldRef.current) (starfieldRef.current.material as THREE.PointsMaterial).opacity = 0.8;
-      if (houseWindowMaterialRef.current) houseWindowMaterialRef.current.emissiveIntensity = 2.5;
-    }
-  }, [isDay]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // --- Weather Logic ---
   useEffect(() => {
-    if (!sceneRef.current) return;
+    if (!sceneRef.current || !cloudsRef.current) return;
 
+    // Clean up previous weather particles
     if (weatherParticlesRef.current) {
       sceneRef.current.remove(weatherParticlesRef.current);
       weatherParticlesRef.current.geometry.dispose();
@@ -581,42 +707,150 @@ export default function App() {
       weatherParticlesRef.current = null;
     }
 
-    if (weather === 'clear') return;
+    // Clean up previous storm clouds
+    stormCloudsRef.current.forEach(c => {
+      cloudsRef.current?.remove(c);
+      c.traverse(child => {
+        if (child instanceof THREE.Mesh) {
+          child.geometry.dispose();
+          (child.material as THREE.Material).dispose();
+        }
+      });
+    });
+    stormCloudsRef.current = [];
 
-    const particleCount = weather === 'windy' ? 500 : 6000;
+    if (weather === 'clear' || weather === 'windy') {
+      // Restore base cloud colors
+      cloudsRef.current.children.forEach(cloud => {
+        cloud.traverse(child => {
+          if (child instanceof THREE.Mesh) {
+            (child.material as THREE.MeshStandardMaterial).color.setHex(0xffffff);
+            (child.material as THREE.MeshStandardMaterial).opacity = 0.9;
+          }
+        });
+      });
+
+      if (weather === 'windy') {
+        // Windy particles (unchanged logic)
+        const particleCount = 500;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        for (let i = 0; i < particleCount * 3; i += 3) {
+          positions[i] = (Math.random() - 0.5) * 50;
+          positions[i + 1] = (Math.random() - 0.5) * 40;
+          positions[i + 2] = (Math.random() - 0.5) * 40;
+        }
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.PointsMaterial({ 
+          color: 0xffffff, size: 0.1, transparent: true, opacity: 0.5 
+        });
+        const particles = new THREE.Points(geometry, material);
+        sceneRef.current.add(particles);
+        weatherParticlesRef.current = particles;
+      }
+      return;
+    }
+
+    // --- Rain or Snow: darken existing clouds and add storm clouds ---
+    const stormColor = weather === 'rain' ? 0x777788 : 0xccccdd;
+    const stormOpacity = weather === 'rain' ? 0.95 : 0.9;
+
+    // Darken base clouds
+    cloudsRef.current.children.forEach(cloud => {
+      cloud.traverse(child => {
+        if (child instanceof THREE.Mesh) {
+          (child.material as THREE.MeshStandardMaterial).color.setHex(stormColor);
+          (child.material as THREE.MeshStandardMaterial).opacity = stormOpacity;
+        }
+      });
+    });
+
+    // Add extra storm clouds
+    const extraCloudCount = 40;
+    const newStormClouds: THREE.Group[] = [];
+    const allCloudPositions: THREE.Vector3[] = [];
+
+    const createStormCloud = (color: number, opacity: number, scale: number) => {
+      const cloud = new THREE.Group();
+      const cloudGeo = new THREE.SphereGeometry(0.3, 12, 12);
+      const cloudMat = new THREE.MeshStandardMaterial({ 
+        color, transparent: true, opacity 
+      });
+      const partCount = 4 + Math.floor(Math.random() * 4);
+      for (let j = 0; j < partCount; j++) {
+        const part = new THREE.Mesh(cloudGeo, cloudMat);
+        part.position.x = (j - partCount / 2) * 0.22;
+        part.position.y = Math.sin(j * 0.8) * 0.08;
+        part.position.z = (Math.random() - 0.5) * 0.15;
+        const s = (0.7 + Math.random() * 0.6) * scale;
+        part.scale.set(s, s * 0.6, s);
+        cloud.add(part);
+      }
+      return cloud;
+    };
+
+    for (let i = 0; i < extraCloudCount; i++) {
+      const cloud = createStormCloud(stormColor, stormOpacity, 1.1 + Math.random() * 0.5);
+      // Restrict storm clouds to the same narrow altitude band
+      const radius = PLANET_RADIUS + 1.2 + Math.random() * 0.2;
+      const phi = Math.random() * Math.PI;
+      const theta = Math.random() * Math.PI * 2;
+      cloud.position.setFromSphericalCoords(radius, phi, theta);
+      cloud.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), cloud.position.clone().normalize());
+      cloudsRef.current.add(cloud);
+      newStormClouds.push(cloud);
+      allCloudPositions.push(cloud.position.clone());
+    }
+    stormCloudsRef.current = newStormClouds;
+
+    // --- Create precipitation particles, each bound to a specific cloud ---
+    const totalClouds = cloudsRef.current.children.length;
+    const particlesPerCloud = weather === 'rain' ? 250 : 150;
+    const particleCount = totalClouds * particlesPerCloud;
     const geometry = new THREE.BufferGeometry();
     const positions = new Float32Array(particleCount * 3);
-    
-    for (let i = 0; i < particleCount * 3; i += 3) {
-      positions[i] = (Math.random() - 0.5) * 50;
-      positions[i + 1] = (Math.random() - 0.5) * 40;
-      positions[i + 2] = (Math.random() - 0.5) * 40;
+    const cloudMap = new Int16Array(particleCount); // particle → cloud index
+    const fallProgress = new Float32Array(particleCount); // 0..1 fall progress
+    const offsets = new Float32Array(particleCount * 2);
+
+    for (let i = 0; i < particleCount; i++) {
+      const ci = Math.floor(i / particlesPerCloud); // assign to cloud sequentially
+      cloudMap[i] = ci;
+      fallProgress[i] = Math.random(); // stagger initial positions
+
+      // Generate random lateral offset within the cloud's horizontal radius
+      const r = Math.random() * 0.8; // coverage radius
+      const th = Math.random() * Math.PI * 2;
+      offsets[i * 2] = r * Math.cos(th);
+      offsets[i * 2 + 1] = r * Math.sin(th);
+
+      // Initial positions will be computed by the animation loop
+      positions[i * 3] = 0;
+      positions[i * 3 + 1] = 0;
+      positions[i * 3 + 2] = 0;
     }
-    
+
+    particleCloudMapRef.current = cloudMap;
+    particleFallProgressRef.current = fallProgress;
+    particleOffsetRef.current = offsets;
+
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
     let material: THREE.PointsMaterial;
     if (weather === 'rain') {
       material = new THREE.PointsMaterial({ 
-        color: 0x93c5fd, 
-        size: 0.2, 
+        color: 0x6ba8f7, 
+        size: 0.018, 
         transparent: true, 
-        opacity: 0.8,
+        opacity: 0.6,
         blending: THREE.AdditiveBlending
       });
-    } else if (weather === 'snow') {
+    } else {
       material = new THREE.PointsMaterial({ 
         color: 0xffffff, 
-        size: 0.25, 
+        size: 0.024, 
         transparent: true, 
-        opacity: 1.0 
-      });
-    } else { // windy
-      material = new THREE.PointsMaterial({ 
-        color: 0xffffff, 
-        size: 0.1, 
-        transparent: true, 
-        opacity: 0.5 
+        opacity: 0.8 
       });
     }
 
@@ -627,23 +861,23 @@ export default function App() {
   }, [weather]);
 
   return (
-    <div className={`relative w-full h-screen overflow-hidden transition-colors duration-1000 ${isDay ? 'bg-sky-300' : 'bg-[#010413]'}`}>
+    <div className="relative w-full h-screen bg-black overflow-hidden font-sans">
       {/* 3D Canvas Container */}
       <div ref={containerRef} className="absolute inset-0 z-0 cursor-grab active:cursor-grabbing" />
 
       {/* UI Overlay */}
-      <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-4 md:p-8 z-10">
-        {/* Header */}
+      <div className="absolute inset-0 pointer-events-none p-4 md:p-8 flex flex-col justify-between z-10">
+        {/* Top bar */}
         <div className="flex justify-between items-start">
           <motion.div 
             initial={{ opacity: 0, x: -20 }}
             animate={{ opacity: 1, x: 0 }}
-            className={`p-3 md:p-6 rounded-2xl backdrop-blur-xl border ${isDay ? 'bg-white/50 border-white/40' : 'bg-black/50 border-white/10'} pointer-events-auto shadow-2xl`}
+            className="p-3 md:p-6 rounded-2xl backdrop-blur-xl border bg-black/50 border-white/10 pointer-events-auto shadow-2xl"
           >
-            <h1 className={`text-lg md:text-3xl font-black tracking-tight ${isDay ? 'text-slate-900' : 'text-white'}`}>
+            <h1 className="text-lg md:text-3xl font-black tracking-tight text-white">
               Tiny Planet
             </h1>
-            <p className={`text-[9px] md:text-sm font-bold mt-0.5 md:mt-1 ${isDay ? 'text-slate-800' : 'text-slate-400'}`}>
+            <p className="text-[9px] md:text-sm font-bold mt-0.5 md:mt-1 text-slate-400">
               Drag to explore • Scroll to zoom
             </p>
           </motion.div>
@@ -652,34 +886,17 @@ export default function App() {
             <motion.button
               whileHover={{ scale: 1.1 }}
               whileTap={{ scale: 0.9 }}
-              onClick={() => setIsDay(!isDay)}
-              className={`p-2.5 md:p-4 rounded-full backdrop-blur-xl border pointer-events-auto shadow-xl transition-all ${
-                isDay ? 'bg-amber-100 border-amber-200 text-amber-600' : 'bg-indigo-900 border-indigo-800 text-indigo-200'
-              }`}
+              onClick={() => setIsRotating(!isRotating)}
+              className="p-2.5 md:p-4 rounded-full backdrop-blur-xl border pointer-events-auto shadow-xl transition-all bg-white/10 border-white/10 text-white"
             >
-              {isDay ? <Sun size={18} className="md:w-6 md:h-6" /> : <Moon size={18} className="md:w-6 md:h-6" />}
+              <RotateCcw size={18} className={`md:w-6 md:h-6 ${isRotating ? 'animate-spin-slow' : ''}`} />
             </motion.button>
             
             <motion.button
               whileHover={{ scale: 1.1 }}
               whileTap={{ scale: 0.9 }}
-              onClick={() => setIsRotating(!isRotating)}
-              className={`p-2.5 md:p-4 rounded-full backdrop-blur-xl border pointer-events-auto shadow-xl transition-all ${
-                isDay ? 'bg-white/70 border-white/50 text-slate-900' : 'bg-white/10 border-white/10 text-white'
-              }`}
-            >
-              {isRotating ? <Pause size={18} className="md:w-6 md:h-6" /> : <Play size={18} className="md:w-6 md:h-6" />}
-            </motion.button>
-
-            <motion.button
-              whileHover={{ scale: 1.1 }}
-              whileTap={{ scale: 0.9 }}
               onClick={() => setIsMuted(!isMuted)}
-              className={`p-2.5 md:p-4 rounded-full backdrop-blur-xl border pointer-events-auto shadow-xl transition-all ${
-                isMuted 
-                  ? 'bg-red-500/20 border-red-500/30 text-red-500' 
-                  : (isDay ? 'bg-white/70 border-white/50 text-slate-900' : 'bg-white/10 border-white/10 text-white')
-              }`}
+              className="p-2.5 md:p-4 rounded-full backdrop-blur-xl border pointer-events-auto shadow-xl transition-all bg-white/10 border-white/10 text-white"
             >
               {isMuted ? <VolumeX size={18} className="md:w-6 md:h-6" /> : <Volume2 size={18} className="md:w-6 md:h-6" />}
             </motion.button>
@@ -709,41 +926,35 @@ export default function App() {
           <motion.div 
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className={`grid grid-cols-4 gap-1 md:gap-3 p-1.5 md:p-3 rounded-2xl backdrop-blur-xl border pointer-events-auto shadow-2xl ${
-              isDay ? 'bg-white/50 border-white/40' : 'bg-black/50 border-white/10'
-            }`}
+            className={`grid grid-cols-4 gap-1 md:gap-3 p-1.5 md:p-3 rounded-2xl backdrop-blur-xl border pointer-events-auto shadow-2xl bg-white/20 border-white/20`}
           >
             <WeatherButton 
               active={weather === 'clear'} 
               onClick={() => setWeather('clear')} 
               icon={<Sun size={16} />} 
               label="Clear"
-              isDay={isDay}
             />
             <WeatherButton 
               active={weather === 'rain'} 
               onClick={() => setWeather('rain')} 
               icon={<CloudRain size={16} />} 
               label="Rain"
-              isDay={isDay}
             />
             <WeatherButton 
               active={weather === 'snow'} 
               onClick={() => setWeather('snow')} 
               icon={<Snowflake size={16} />} 
               label="Snow"
-              isDay={isDay}
             />
             <WeatherButton 
               active={weather === 'windy'} 
               onClick={() => setWeather('windy')} 
               icon={<Wind size={16} />} 
               label="Wind"
-              isDay={isDay}
             />
           </motion.div>
           
-          <div className={`text-[9px] md:text-xs font-black uppercase tracking-[0.3em] ${isDay ? 'text-slate-800' : 'text-slate-500'}`}>
+          <div className={`text-[9px] md:text-xs font-black uppercase tracking-[0.3em] text-white/50`}>
             {weather} mode
           </div>
         </div>
@@ -780,20 +991,19 @@ export default function App() {
   );
 }
 
-function WeatherButton({ active, onClick, icon, label, isDay }: { 
+function WeatherButton({ active, onClick, icon, label }: { 
   active: boolean; 
   onClick: () => void; 
   icon: React.ReactNode; 
   label: string;
-  isDay: boolean;
 }) {
   return (
     <button
       onClick={onClick}
       className={`flex flex-col md:flex-row items-center justify-center gap-1 md:gap-2 px-2 md:px-5 py-1.5 md:py-3 rounded-xl transition-all ${
         active 
-          ? (isDay ? 'bg-white text-slate-900 shadow-xl scale-110' : 'bg-white/30 text-white scale-110') 
-          : (isDay ? 'text-slate-800 hover:bg-white/30' : 'text-slate-400 hover:bg-white/10')
+          ? 'bg-white/30 text-white shadow-xl scale-110' 
+          : 'text-slate-400 hover:bg-white/10'
       }`}
     >
       <span className={active ? 'scale-125' : ''}>{icon}</span>
