@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Sun, CloudRain, Snowflake, Wind, Volume2, VolumeX, RotateCcw } from 'lucide-react';
+import { Sun, CloudRain, Snowflake, Wind, Volume2, VolumeX, RotateCcw, Plane } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 // --- Types ---
@@ -20,6 +20,11 @@ export default function App() {
   const [isRotating, setIsRotating] = useState(true);
   const [isMuted, setIsMuted] = useState(true);
   const [volume, setVolume] = useState(0.3);
+  
+  // Flight Controls
+  const [flightMode, setFlightMode] = useState(false);
+  const [cameraView, setCameraView] = useState<'orbit' | 'third-person' | 'cockpit'>('orbit');
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Refs to track latest state inside the animation loop (avoids stale closures)
@@ -86,6 +91,27 @@ export default function App() {
   const particleFallProgressRef = useRef<Float32Array>(new Float32Array(0)); // 0 = at cloud, 1 = at surface
   const particleOffsetRef = useRef<Float32Array>(new Float32Array(0)); // [latX, latZ, latX, latZ...]
   const celestialGroupRef = useRef<THREE.Group | null>(null);
+
+  // Flight Interaction Refs
+  const keysRef = useRef<{ [key: string]: boolean }>({});
+  const planeSpeedRef = useRef(0);
+  const flightModeRef = useRef(flightMode);
+  const cameraViewRef = useRef(cameraView);
+
+  useEffect(() => { flightModeRef.current = flightMode; }, [flightMode]);
+  useEffect(() => { cameraViewRef.current = cameraView; }, [cameraView]);
+
+  // Keyboard listeners for flight
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => { keysRef.current[e.code] = true; };
+    const handleKeyUp = (e: KeyboardEvent) => { keysRef.current[e.code] = false; };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -627,41 +653,148 @@ export default function App() {
         cloudsRef.current!.rotation.y += 0.002;
       }
 
-      if (isRotatingRef.current && airplanePivotRef.current && airplaneTiltRef.current) {
-        airplanePivotRef.current.rotation.y += 0.008;
-        airplaneTiltRef.current.rotation.x += 0.0005;
-        airplaneTiltRef.current.rotation.z += 0.0003;
+      // Plane Animation
+      if (airplanePivotRef.current && airplaneTiltRef.current) {
+        if (!flightModeRef.current && isRotatingRef.current) {
+          // Auto-orbit mode: keep flying forward naturally
+          airplanePivotRef.current.rotateY(0.008);
+          // Restore plane to flat orientation
+          const airplane = airplanePivotRef.current.children[0];
+          if (airplane) {
+            airplane.rotation.z = THREE.MathUtils.lerp(airplane.rotation.z, -Math.PI / 2, 0.05);
+          }
+          airplanePivotRef.current.quaternion.normalize();
+        } else if (flightModeRef.current) {
+          // Manual Flight mode
+          const keys = keysRef.current;
+          const airplane = airplanePivotRef.current.children[0];
+
+          // Speed control (Forward is positive rotation around Y axis)
+          if (keys['KeyW'] || keys['ArrowUp']) planeSpeedRef.current += 0.0005;
+          else if (keys['KeyS'] || keys['ArrowDown']) planeSpeedRef.current -= 0.0005;
+          else planeSpeedRef.current *= 0.98; // Drag
+          
+          planeSpeedRef.current = THREE.MathUtils.clamp(planeSpeedRef.current, -0.015, 0.025);
+
+          // Turning (Yaw is around local X axis)
+          let targetRoll = -Math.PI / 2;
+          if (keys['KeyA'] || keys['ArrowLeft']) {
+            airplanePivotRef.current.rotateX(0.04);
+            targetRoll = -Math.PI / 2 + 0.6;
+          } else if (keys['KeyD'] || keys['ArrowRight']) {
+            airplanePivotRef.current.rotateX(-0.04);
+            targetRoll = -Math.PI / 2 - 0.6;
+          }
+
+          // Visual roll
+          if (airplane) {
+            airplane.rotation.z = THREE.MathUtils.lerp(airplane.rotation.z, targetRoll, 0.1);
+          }
+
+          // Move Forward along globe surface
+          airplanePivotRef.current.rotateY(planeSpeedRef.current);
+          
+          // Normalize quaternion to prevent drift
+          airplanePivotRef.current.quaternion.normalize();
+        }
         
+        // Propeller animation
         const airplane = airplanePivotRef.current.children[0];
         if (airplane) {
           const prop = airplane.getObjectByName("propeller");
           if (prop) prop.rotation.z += 0.3;
         }
+
+        // Camera Follow Logic
+        if (flightModeRef.current && cameraRef.current) {
+          // Temporarily disable OrbitControls
+          controls.enabled = false;
+          
+          // Get the actual world position and rotation of the airplane mesh
+          const planeWorldPos = new THREE.Vector3();
+          airplane.getWorldPosition(planeWorldPos);
+          
+          const planeWorldQuat = new THREE.Quaternion();
+          airplane.getWorldQuaternion(planeWorldQuat);
+
+          // Get the 'up' vector (away from planet center)
+          const upVector = planeWorldPos.clone().normalize();
+
+          // Get the 'forward' vector of the plane (propeller is at -Z)
+          const forwardVector = new THREE.Vector3(0, 0, -1).applyQuaternion(planeWorldQuat).normalize();
+
+          // Set camera's UP vector to align with the plane's UP vector (away from planet)
+          cameraRef.current.up.copy(upVector);
+
+          if (cameraViewRef.current === 'third-person') {
+            // Zoom in slightly for 3rd person
+            cameraRef.current.zoom = THREE.MathUtils.lerp(cameraRef.current.zoom, 2.5, 0.05);
+            cameraRef.current.updateProjectionMatrix();
+
+            // Position camera behind and up 
+            const offset = forwardVector.clone().multiplyScalar(-6).add(upVector.clone().multiplyScalar(4));
+            const targetCamPos = planeWorldPos.clone().add(offset);
+            cameraRef.current.position.lerp(targetCamPos, 0.1);
+            
+            // Look exactly at the plane to keep it perfectly centered onscreen
+            cameraRef.current.lookAt(planeWorldPos);
+          } else if (cameraViewRef.current === 'cockpit') {
+            // Zoom in drastically since Orthographic cameras don't physically "get closer" just by moving position
+            cameraRef.current.zoom = THREE.MathUtils.lerp(cameraRef.current.zoom, 8.0, 0.05);
+            cameraRef.current.updateProjectionMatrix();
+
+            // Position camera exactly at the cockpit window, looking forward
+            const offset = forwardVector.clone().multiplyScalar(0.4).add(upVector.clone().multiplyScalar(0.2));
+            cameraRef.current.position.copy(planeWorldPos).add(offset);
+            
+            const lookAtTarget = cameraRef.current.position.clone().add(forwardVector.clone().multiplyScalar(10));
+            cameraRef.current.lookAt(lookAtTarget);
+          }
+        } else {
+          // Re-enable and update orbit controls
+          
+          if (cameraRef.current && cameraRef.current.zoom !== 1.0) {
+            cameraRef.current.zoom = THREE.MathUtils.lerp(cameraRef.current.zoom, 1.0, 0.05);
+            if (Math.abs(cameraRef.current.zoom - 1.0) < 0.01) cameraRef.current.zoom = 1.0;
+            cameraRef.current.updateProjectionMatrix();
+          }
+
+          // Smoothly revert camera UP to world UP
+          if (cameraRef.current) {
+            cameraRef.current.up.lerp(new THREE.Vector3(0, 1, 0), 0.1);
+          }
+
+          controls.enabled = true;
+          controls.update();
+        }
       }
 
-      if (isRotatingRef.current && birdPivotsRef.current) {
-        const time = Date.now() * 0.01;
-        birdPivotsRef.current.forEach((pivot, index) => {
-          pivot.rotation.y += 0.004 + index * 0.0005;
-          if (pivot.parent) {
-            pivot.parent.rotation.x += 0.0002;
-          }
+      // Update clouds and birds rotation if global rotation is on and not in flight mode (or keep passive objects moving anyway)
+      if (isRotatingRef.current) {
+          cloudsRef.current!.rotation.y += 0.002;
           
-          pivot.children.forEach((bird, bIndex) => {
-            const lw = bird.getObjectByName("lw");
-            const rw = bird.getObjectByName("rw");
-            if (lw && rw) {
-              const flap = Math.sin(time * 1.5 + bIndex) * 0.4;
-              lw.rotation.z = flap;
-              rw.rotation.z = -flap;
-            }
-          });
-        });
+          if (birdPivotsRef.current) {
+            const time = Date.now() * 0.01;
+            birdPivotsRef.current.forEach((pivot, index) => {
+              pivot.rotation.y += 0.004 + index * 0.0005;
+              if (pivot.parent) {
+                pivot.parent.rotation.x += 0.0002;
+              }
+              
+              pivot.children.forEach((bird, bIndex) => {
+                const lw = bird.getObjectByName("lw");
+                const rw = bird.getObjectByName("rw");
+                if (lw && rw) {
+                  const flap = Math.sin(time * 1.5 + bIndex) * 0.4;
+                  lw.rotation.z = flap;
+                  rw.rotation.z = -flap;
+                }
+              });
+            });
+          }
       }
 
       // (Disabled starfield rotation per user request)
-
-      controls.update();
 
       // Weather animation - each particle is bound to its parent cloud
       if (weatherParticlesRef.current && cloudsRef.current) {
@@ -939,22 +1072,63 @@ export default function App() {
       {/* 3D Canvas Container */}
       <div ref={containerRef} className="absolute inset-0 z-0 cursor-grab active:cursor-grabbing" />
 
+      {/* Flight Control Overlay */}
+      <AnimatePresence>
+        {flightMode && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="absolute top-6 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-3 w-full max-w-sm px-4 md:px-0"
+          >
+            <div className="bg-black/60 backdrop-blur-md px-6 py-4 rounded-2xl border border-white/10 shadow-2xl w-full">
+              <h3 className="text-lg font-black text-white mb-2 text-center md:text-left">Flight Controls</h3>
+              <div className="flex flex-col gap-2 text-sm text-slate-300 font-medium">
+                <div className="flex justify-between items-center"><span className="opacity-80">Accelerate </span><span className="font-mono bg-white/10 px-2 py-0.5 rounded text-white border border-white/5">W / ↑</span></div>
+                <div className="flex justify-between items-center"><span className="opacity-80">Decelerate / Reverse</span><span className="font-mono bg-white/10 px-2 py-0.5 rounded text-white border border-white/5">S / ↓</span></div>
+                <div className="flex justify-between items-center"><span className="opacity-80">Steer Left / Right</span><span className="font-mono bg-white/10 px-2 py-0.5 rounded text-white border border-white/5">A / D / ← →</span></div>
+              </div>
+            </div>
+            
+            <div className="bg-black/60 backdrop-blur-md p-1.5 rounded-2xl border border-white/10 shadow-xl flex gap-1 w-full relative">
+               <button 
+                onClick={() => setCameraView('third-person')}
+                className={`flex-1 px-4 py-2.5 rounded-xl text-sm font-bold transition-colors ${cameraView === 'third-person' ? 'bg-sky-500/80 text-white shadow-inner' : 'hover:bg-white/10 text-slate-400'}`}
+              >
+                3rd Person
+              </button>
+              <button 
+                onClick={() => setCameraView('cockpit')}
+                 className={`flex-1 px-4 py-2.5 rounded-xl text-sm font-bold transition-colors ${cameraView === 'cockpit' ? 'bg-sky-500/80 text-white shadow-inner' : 'hover:bg-white/10 text-slate-400'}`}
+              >
+                Cockpit
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* UI Overlay */}
       <div className="absolute inset-0 pointer-events-none p-4 md:p-8 flex flex-col justify-between z-10">
         {/* Top bar */}
         <div className="flex justify-between items-start">
-          <motion.div 
-            initial={{ opacity: 0, x: -20 }}
-            animate={{ opacity: 1, x: 0 }}
-            className="p-3 md:p-6 rounded-2xl backdrop-blur-xl border bg-black/50 border-white/10 pointer-events-auto shadow-2xl"
-          >
-            <h1 className="text-lg md:text-3xl font-black tracking-tight text-white">
-              Tiny Planet
-            </h1>
-            <p className="text-[9px] md:text-sm font-bold mt-0.5 md:mt-1 text-slate-400">
-              Drag to explore • Scroll to zoom
-            </p>
-          </motion.div>
+          <AnimatePresence>
+            {!flightMode && (
+              <motion.div 
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="p-3 md:p-6 rounded-2xl backdrop-blur-xl border bg-black/50 border-white/10 pointer-events-auto shadow-2xl"
+              >
+                <h1 className="text-lg md:text-3xl font-black tracking-tight text-white">
+                  Tiny Planet
+                </h1>
+                <p className="text-[9px] md:text-sm font-bold mt-0.5 md:mt-1 text-slate-400">
+                  Drag to explore • Scroll to zoom
+                </p>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           <div className="flex flex-col gap-2 md:gap-4 items-end">
             <motion.button
@@ -1000,32 +1174,61 @@ export default function App() {
           <motion.div 
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className={`grid grid-cols-4 gap-1 md:gap-3 p-1.5 md:p-3 rounded-2xl backdrop-blur-xl border pointer-events-auto shadow-2xl bg-white/20 border-white/20`}
+            className={`flex items-center gap-1 md:gap-3 p-1.5 md:p-3 rounded-2xl backdrop-blur-xl border pointer-events-auto shadow-2xl bg-white/20 border-white/20`}
           >
-            <WeatherButton 
-              active={weather === 'clear'} 
-              onClick={() => setWeather('clear')} 
-              icon={<Sun size={16} />} 
-              label="Clear"
-            />
-            <WeatherButton 
-              active={weather === 'rain'} 
-              onClick={() => setWeather('rain')} 
-              icon={<CloudRain size={16} />} 
-              label="Rain"
-            />
-            <WeatherButton 
-              active={weather === 'snow'} 
-              onClick={() => setWeather('snow')} 
-              icon={<Snowflake size={16} />} 
-              label="Snow"
-            />
-            <WeatherButton 
-              active={weather === 'windy'} 
-              onClick={() => setWeather('windy')} 
-              icon={<Wind size={16} />} 
-              label="Wind"
-            />
+            {/* Weather Buttons */}
+            <div className="grid grid-cols-4 gap-1 md:gap-3">
+              <WeatherButton 
+                active={weather === 'clear'} 
+                onClick={() => setWeather('clear')} 
+                icon={<Sun size={16} />} 
+                label="Clear"
+              />
+              <WeatherButton 
+                active={weather === 'rain'} 
+                onClick={() => setWeather('rain')} 
+                icon={<CloudRain size={16} />} 
+                label="Rain"
+              />
+              <WeatherButton 
+                active={weather === 'snow'} 
+                onClick={() => setWeather('snow')} 
+                icon={<Snowflake size={16} />} 
+                label="Snow"
+              />
+              <WeatherButton 
+                active={weather === 'windy'} 
+                onClick={() => setWeather('windy')} 
+                icon={<Wind size={16} />} 
+                label="Wind"
+              />
+            </div>
+
+            {/* Separator */}
+            <div className="w-px h-10 bg-white/20 mx-1 md:mx-2 hidden md:block"></div>
+
+            {/* Flight Toggle Button */}
+            <button
+              onClick={() => {
+                if (flightMode) {
+                  setFlightMode(false);
+                  setCameraView('orbit');
+                } else {
+                  setFlightMode(true);
+                  setCameraView('third-person');
+                }
+              }}
+              className={`flex flex-col items-center justify-center px-4 py-2 md:py-3 rounded-xl transition-all duration-300 ${
+                flightMode 
+                  ? 'bg-emerald-500/50 text-white shadow-inner scale-95 border border-emerald-400/50' 
+                  : 'text-slate-200 hover:bg-white/10 hover:text-white border border-transparent'
+              }`}
+            >
+              <Plane size={18} className="md:w-6 md:h-6 mb-1" />
+              <span className="text-[9px] md:text-xs font-bold uppercase tracking-wider hidden sm:block">
+                {flightMode ? 'EXIT CONTROL' : 'FLY'}
+              </span>
+            </button>
           </motion.div>
           
           <div className={`text-[9px] md:text-xs font-black uppercase tracking-[0.3em] text-white/50`}>
