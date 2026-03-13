@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Sun, CloudRain, Snowflake, Wind, Volume2, VolumeX, RotateCcw, Plane } from 'lucide-react';
+import { Sun, CloudRain, Snowflake, Wind, Volume2, VolumeX, RotateCcw, Plane, User, Triangle as Parachute } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 // --- Types ---
@@ -14,6 +14,32 @@ const HOUSE_COUNT = 45;
 const CLOUD_COUNT = 30;
 const WATER_LEVEL = 0.998; // Relative to PLANET_RADIUS
 
+// --- Helper Functions ---
+const getTerrainHeight = (v: THREE.Vector3) => {
+  // Use a combination of sine waves with non-integer frequencies to simulate organic noise
+  const f1 = 0.4, f2 = 1.3, f3 = 2.7;
+  
+  const n1 = Math.sin(v.x * f1 + Math.cos(v.y * f1)) * Math.cos(v.z * f1 + Math.sin(v.x * f1));
+  const n2 = Math.sin(v.x * f2 + v.y * f2) * Math.cos(v.z * f2 - v.x * f2);
+  const n3 = Math.sin(v.x * f3) * Math.cos(v.y * f3 + v.z * f3);
+
+  // Combine: mostly low frequency for gentle continents, less high frequency
+  let d = (n1 * 0.6) + (n2 * 0.3) + (n3 * 0.1);
+  
+  // Bias upwards to create more landmass than ocean
+  d += 0.35; 
+  
+  // Scale to make hills gentle and proportional to the planet (radius 5)
+  d *= 0.3;
+
+  // Smooth out the deep valleys so oceans aren't infinitely deep
+  if (d < -0.05) {
+    d = -0.05 + (d + 0.05) * 0.4;
+  }
+  
+  return d; 
+};
+
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [weather, setWeather] = useState<Weather>('clear');
@@ -24,6 +50,8 @@ export default function App() {
   // Flight Controls
   const [flightMode, setFlightMode] = useState(false);
   const [cameraView, setCameraView] = useState<'orbit' | 'third-person' | 'cockpit'>('orbit');
+  const [fpsMode, setFpsMode] = useState(false);
+  const [showFpsInstructions, setShowFpsInstructions] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -73,7 +101,10 @@ export default function App() {
 
   // Three.js refs
   const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
+  const orthoCameraRef = useRef<THREE.OrthographicCamera | null>(null);
+  const perspCameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const cameraRef = useRef<THREE.Camera | null>(null);
+  const weaponGroupRef = useRef<THREE.Group | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const planetRef = useRef<THREE.Group | null>(null);
   const cloudsRef = useRef<THREE.Group | null>(null);
@@ -97,19 +128,46 @@ export default function App() {
   const planeSpeedRef = useRef(0);
   const flightModeRef = useRef(flightMode);
   const cameraViewRef = useRef(cameraView);
+  const fpsModeRef = useRef(fpsMode);
+
+  // FPS Character Refs
+  const characterPosRef = useRef(new THREE.Vector3());
+  const characterQuatRef = useRef(new THREE.Quaternion());
+  const characterVelocityRef = useRef(new THREE.Vector3());
+  const fpsYawRef = useRef(0);
+  const fpsPitchRef = useRef(0);
 
   useEffect(() => { flightModeRef.current = flightMode; }, [flightMode]);
   useEffect(() => { cameraViewRef.current = cameraView; }, [cameraView]);
+  useEffect(() => { fpsModeRef.current = fpsMode; }, [fpsMode]);
+
+  // Auto-hide FPS instructions after 1.5 seconds
+  useEffect(() => {
+    if (showFpsInstructions) {
+      const timer = setTimeout(() => setShowFpsInstructions(false), 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [showFpsInstructions]);
 
   // Keyboard listeners for flight
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => { keysRef.current[e.code] = true; };
     const handleKeyUp = (e: KeyboardEvent) => { keysRef.current[e.code] = false; };
+    const handleMouseMove = (e: MouseEvent) => {
+      if (fpsModeRef.current) {
+        fpsYawRef.current -= e.movementX * 0.002;
+        fpsPitchRef.current -= e.movementY * 0.002;
+        fpsPitchRef.current = THREE.MathUtils.clamp(fpsPitchRef.current, -Math.PI / 2.2, Math.PI / 2.2);
+      }
+    };
+    
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('mousemove', handleMouseMove);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('mousemove', handleMouseMove);
     };
   }, []);
 
@@ -120,19 +178,52 @@ export default function App() {
     const scene = new THREE.Scene();
     sceneRef.current = scene;
     
-    // Orthographic Camera completely eliminates perspective/fisheye distortion
+    // --- Camera Setup ---
     const aspect = window.innerWidth / window.innerHeight;
-    const frustumSize = 18;
-    const camera = new THREE.OrthographicCamera(
-      frustumSize * aspect / -2,
-      frustumSize * aspect / 2,
-      frustumSize / 2,
-      frustumSize / -2,
+    
+    // 1. Orthographic Camera (Planet/Third-Person)
+    const frustumSizeOrtho = 18;
+    const orthoCamera = new THREE.OrthographicCamera(
+      frustumSizeOrtho * aspect / -2,
+      frustumSizeOrtho * aspect / 2,
+      frustumSizeOrtho / 2,
+      frustumSizeOrtho / -2,
       0.1,
       1000
     );
-    camera.position.set(0, 6, 18);
-    cameraRef.current = camera;
+    orthoCamera.position.set(0, 6, 18);
+    orthoCameraRef.current = orthoCamera;
+
+    // 2. Perspective Camera (FPS / Cockpit)
+    const perspCamera = new THREE.PerspectiveCamera(75, aspect, 0.01, 1000);
+    perspCameraRef.current = perspCamera;
+    
+    // Start with Ortho
+    cameraRef.current = orthoCamera;
+
+    // --- Weapon View-model (for FPS) ---
+    const weaponGroup = new THREE.Group();
+    weaponGroup.scale.set(0.3, 0.3, 0.3); // Scale down for tiny planet proportions
+    // Gun body
+    const gunBody = new THREE.Mesh(
+      new THREE.BoxGeometry(0.08, 0.12, 0.4),
+      new THREE.MeshStandardMaterial({ color: 0x1f2937, metalness: 0.8, roughness: 0.3 })
+    );
+    gunBody.position.set(0.2, -0.1, -0.25);
+    weaponGroup.add(gunBody);
+    
+    // Barrel
+    const barrel = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.02, 0.02, 0.2),
+      new THREE.MeshStandardMaterial({ color: 0x0f172a, metalness: 0.9, roughness: 0.1 })
+    );
+    barrel.rotation.x = Math.PI / 2;
+    barrel.position.set(0.2, -0.08, -0.4);
+    weaponGroup.add(barrel);
+    
+    scene.add(perspCamera); 
+    perspCamera.add(weaponGroup);
+    weaponGroupRef.current = weaponGroup;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -141,8 +232,36 @@ export default function App() {
     containerRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
+    const handleResize = () => {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const resAspect = width / height;
+
+      // Update Ortho
+      const fSize = 18;
+      orthoCamera.left = fSize * resAspect / -2;
+      orthoCamera.right = fSize * resAspect / 2;
+      orthoCamera.top = fSize / 2;
+      orthoCamera.bottom = fSize / -2;
+      orthoCamera.updateProjectionMatrix();
+
+      // Update Persp
+      perspCamera.aspect = resAspect;
+      perspCamera.updateProjectionMatrix();
+
+      renderer.setSize(width, height);
+    };
+    window.addEventListener('resize', handleResize);
+
+    const handleCanvasClick = () => {
+      if (fpsModeRef.current) {
+        renderer.domElement.requestPointerLock();
+      }
+    };
+    renderer.domElement.addEventListener('click', handleCanvasClick);
+
     // --- Controls ---
-    const controls = new OrbitControls(camera, renderer.domElement);
+    const controls = new OrbitControls(orthoCamera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.rotateSpeed = 0.8;
@@ -162,31 +281,7 @@ export default function App() {
     grassTexture.wrapT = THREE.RepeatWrapping;
     grassTexture.repeat.set(8, 8); // Repeat for detail
 
-    // Helper for Terrain Height
-    const getTerrainHeight = (v: THREE.Vector3) => {
-      // Use a combination of sine waves with non-integer frequencies to simulate organic noise
-      const f1 = 0.4, f2 = 1.3, f3 = 2.7;
-      
-      const n1 = Math.sin(v.x * f1 + Math.cos(v.y * f1)) * Math.cos(v.z * f1 + Math.sin(v.x * f1));
-      const n2 = Math.sin(v.x * f2 + v.y * f2) * Math.cos(v.z * f2 - v.x * f2);
-      const n3 = Math.sin(v.x * f3) * Math.cos(v.y * f3 + v.z * f3);
 
-      // Combine: mostly low frequency for gentle continents, less high frequency
-      let d = (n1 * 0.6) + (n2 * 0.3) + (n3 * 0.1);
-      
-      // Bias upwards to create more landmass than ocean
-      d += 0.35; 
-      
-      // Scale to make hills gentle and proportional to the planet (radius 5)
-      d *= 0.3;
-
-      // Smooth out the deep valleys so oceans aren't infinitely deep
-      if (d < -0.05) {
-        d = -0.05 + (d + 0.05) * 0.4;
-      }
-      
-      return d; 
-    };
 
     // Surface
     const geometry = new THREE.SphereGeometry(PLANET_RADIUS, 128, 128);
@@ -648,17 +743,19 @@ export default function App() {
     const animate = () => {
       frameId = requestAnimationFrame(animate);
       
-      if (isRotatingRef.current && planetRef.current) {
+      // Only rotate the planet automatically if not in flight mode or FPS mode
+      if (isRotatingRef.current && planetRef.current && !flightModeRef.current && !fpsModeRef.current) {
         planetRef.current.rotation.y += 0.003;
-        cloudsRef.current!.rotation.y += 0.002;
+        cloudsRef.current!.rotation.y += 0.0004;
       }
 
-      // Plane Animation
+      // ============================================
+      // 1. AIRPLANE ANIMATION (always runs independently)
+      // ============================================
       if (airplanePivotRef.current && airplaneTiltRef.current) {
-        if (!flightModeRef.current && isRotatingRef.current) {
+        if (!flightModeRef.current && !fpsModeRef.current) {
           // Auto-orbit mode: keep flying forward naturally
           airplanePivotRef.current.rotateY(0.008);
-          // Restore plane to flat orientation
           const airplane = airplanePivotRef.current.children[0];
           if (airplane) {
             airplane.rotation.z = THREE.MathUtils.lerp(airplane.rotation.z, -Math.PI / 2, 0.05);
@@ -669,14 +766,12 @@ export default function App() {
           const keys = keysRef.current;
           const airplane = airplanePivotRef.current.children[0];
 
-          // Speed control (Forward is positive rotation around Y axis)
           if (keys['KeyW'] || keys['ArrowUp']) planeSpeedRef.current += 0.0005;
           else if (keys['KeyS'] || keys['ArrowDown']) planeSpeedRef.current -= 0.0005;
-          else planeSpeedRef.current *= 0.98; // Drag
+          else planeSpeedRef.current *= 0.98;
           
           planeSpeedRef.current = THREE.MathUtils.clamp(planeSpeedRef.current, -0.015, 0.025);
 
-          // Turning (Yaw is around local X axis)
           let targetRoll = -Math.PI / 2;
           if (keys['KeyA'] || keys['ArrowLeft']) {
             airplanePivotRef.current.rotateX(0.04);
@@ -686,112 +781,195 @@ export default function App() {
             targetRoll = -Math.PI / 2 - 0.6;
           }
 
-          // Visual roll
           if (airplane) {
             airplane.rotation.z = THREE.MathUtils.lerp(airplane.rotation.z, targetRoll, 0.1);
           }
 
-          // Move Forward along globe surface
           airplanePivotRef.current.rotateY(planeSpeedRef.current);
-          
-          // Normalize quaternion to prevent drift
           airplanePivotRef.current.quaternion.normalize();
         }
         
-        // Propeller animation
+        // Propeller animation (always)
         const airplane = airplanePivotRef.current.children[0];
         if (airplane) {
           const prop = airplane.getObjectByName("propeller");
           if (prop) prop.rotation.z += 0.3;
         }
+      }
 
-        // Camera Follow Logic
-        if (flightModeRef.current && cameraRef.current) {
-          // Temporarily disable OrbitControls
-          controls.enabled = false;
+      // ============================================
+      // 2. CAMERA LOGIC (priority: FPS > Flight > Orbit)
+      // ============================================
+      if (fpsModeRef.current) {
+        // --- FPS MODE ---
+        cameraRef.current = perspCameraRef.current;
+        if (!cameraRef.current) return;
+
+        controls.enabled = false;
+
+        const up = characterPosRef.current.clone().normalize();
+        const keys = keysRef.current;
+
+        // Gravity
+        const gravityForce = 0.006;
+        const jumpImpulse = 0.15;
+        characterVelocityRef.current.add(up.clone().multiplyScalar(-gravityForce));
+
+        // Character orientation on sphere
+        const baseQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), up);
+        const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), fpsYawRef.current);
+        const combinedQuat = baseQuat.clone().multiply(yawQuat);
+
+        // Movement
+        const moveDir = new THREE.Vector3();
+        if (keys['KeyW'] || keys['ArrowUp']) moveDir.z -= 1;
+        if (keys['KeyS'] || keys['ArrowDown']) moveDir.z += 1;
+        if (keys['KeyA'] || keys['ArrowLeft']) moveDir.x -= 1;
+        if (keys['KeyD'] || keys['ArrowRight']) moveDir.x += 1;
+        
+        if (moveDir.lengthSq() > 0) {
+          moveDir.normalize().applyQuaternion(combinedQuat).multiplyScalar(0.08);
+          characterPosRef.current.add(moveDir);
           
-          // Get the actual world position and rotation of the airplane mesh
+          // Weapon walk sway
+          if (weaponGroupRef.current) {
+            const time = Date.now() * 0.008;
+            weaponGroupRef.current.position.y = -0.06 + Math.sin(time) * 0.003;
+            weaponGroupRef.current.position.x = 0.08 + Math.cos(time * 0.5) * 0.003;
+          }
+        } else {
+          // Idle sway
+          if (weaponGroupRef.current) {
+            const time = Date.now() * 0.002;
+            weaponGroupRef.current.position.y = -0.06 + Math.sin(time) * 0.001;
+            weaponGroupRef.current.position.x = 0.08;
+          }
+        }
+
+        // Apply velocity (gravity/jump)
+        characterPosRef.current.add(characterVelocityRef.current);
+
+        // Ground collision
+        const unitPos = characterPosRef.current.clone().normalize();
+        const terrainH = getTerrainHeight(unitPos);
+        const distFromCenter = characterPosRef.current.length();
+        const targetRadius = PLANET_RADIUS + terrainH + 0.15;
+        
+        if (distFromCenter < targetRadius) {
+          characterPosRef.current.setLength(targetRadius);
+          
+          if (characterVelocityRef.current.dot(up) < 0) {
+            characterVelocityRef.current.set(0, 0, 0);
+          }
+
+          if (keys['Space']) {
+            characterVelocityRef.current.add(up.clone().multiplyScalar(jumpImpulse));
+          }
+        }
+
+        // Camera at eye level
+        if (weaponGroupRef.current) weaponGroupRef.current.visible = true;
+        cameraRef.current.position.copy(characterPosRef.current);
+        
+        // Orientation: Surface + Yaw + Pitch
+        const pitchQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), fpsPitchRef.current);
+        const finalCameraQuat = combinedQuat.clone().multiply(pitchQuat);
+        cameraRef.current.quaternion.copy(finalCameraQuat);
+
+      } else if (flightModeRef.current) {
+        // --- FLIGHT MODE CAMERA ---
+        controls.enabled = false;
+
+        if (cameraViewRef.current === 'cockpit') {
+          cameraRef.current = perspCameraRef.current;
+        } else {
+          cameraRef.current = orthoCameraRef.current;
+        }
+        if (!cameraRef.current) return;
+
+        const airplane = airplanePivotRef.current?.children[0];
+        if (airplane) {
           const planeWorldPos = new THREE.Vector3();
           airplane.getWorldPosition(planeWorldPos);
           
           const planeWorldQuat = new THREE.Quaternion();
           airplane.getWorldQuaternion(planeWorldQuat);
 
-          // Get the 'up' vector (away from planet center)
           const upVector = planeWorldPos.clone().normalize();
-
-          // Get the 'forward' vector of the plane (propeller is at -Z)
           const forwardVector = new THREE.Vector3(0, 0, -1).applyQuaternion(planeWorldQuat).normalize();
 
-          // Set camera's UP vector to align with the plane's UP vector (away from planet)
           cameraRef.current.up.copy(upVector);
 
           if (cameraViewRef.current === 'third-person') {
-            // Zoom in slightly for 3rd person
-            cameraRef.current.zoom = THREE.MathUtils.lerp(cameraRef.current.zoom, 2.5, 0.05);
-            cameraRef.current.updateProjectionMatrix();
+            const ortho = cameraRef.current as THREE.OrthographicCamera;
+            ortho.zoom = THREE.MathUtils.lerp(ortho.zoom, 2.5, 0.05);
+            ortho.updateProjectionMatrix();
 
-            // Position camera behind and up 
             const offset = forwardVector.clone().multiplyScalar(-6).add(upVector.clone().multiplyScalar(4));
             const targetCamPos = planeWorldPos.clone().add(offset);
             cameraRef.current.position.lerp(targetCamPos, 0.1);
-            
-            // Look exactly at the plane to keep it perfectly centered onscreen
             cameraRef.current.lookAt(planeWorldPos);
           } else if (cameraViewRef.current === 'cockpit') {
-            // Zoom in drastically since Orthographic cameras don't physically "get closer" just by moving position
-            cameraRef.current.zoom = THREE.MathUtils.lerp(cameraRef.current.zoom, 8.0, 0.05);
-            cameraRef.current.updateProjectionMatrix();
-
-            // Position camera exactly at the cockpit window, looking forward
             const offset = forwardVector.clone().multiplyScalar(0.4).add(upVector.clone().multiplyScalar(0.2));
             cameraRef.current.position.copy(planeWorldPos).add(offset);
             
             const lookAtTarget = cameraRef.current.position.clone().add(forwardVector.clone().multiplyScalar(10));
             cameraRef.current.lookAt(lookAtTarget);
           }
-        } else {
-          // Re-enable and update orbit controls
-          
-          if (cameraRef.current && cameraRef.current.zoom !== 1.0) {
-            cameraRef.current.zoom = THREE.MathUtils.lerp(cameraRef.current.zoom, 1.0, 0.05);
-            if (Math.abs(cameraRef.current.zoom - 1.0) < 0.01) cameraRef.current.zoom = 1.0;
-            cameraRef.current.updateProjectionMatrix();
-          }
-
-          // Smoothly revert camera UP to world UP
-          if (cameraRef.current) {
-            cameraRef.current.up.lerp(new THREE.Vector3(0, 1, 0), 0.1);
-          }
-
-          controls.enabled = true;
-          controls.update();
         }
+
+        if (weaponGroupRef.current) weaponGroupRef.current.visible = false;
+
+      } else {
+        // --- ORBIT MODE (default) ---
+        cameraRef.current = orthoCameraRef.current;
+        if (!cameraRef.current) return;
+        const ortho = cameraRef.current as THREE.OrthographicCamera;
+
+        // Reset zoom smoothly
+        if (ortho.zoom !== 1.0) {
+          ortho.zoom = THREE.MathUtils.lerp(ortho.zoom, 1.0, 0.05);
+          if (Math.abs(ortho.zoom - 1.0) < 0.01) ortho.zoom = 1.0;
+          ortho.updateProjectionMatrix();
+        }
+
+        // Reset camera position smoothly to initial position
+        const initialPos = new THREE.Vector3(0, 6, 18);
+        cameraRef.current.position.lerp(initialPos, 0.05);
+
+        // Smoothly revert camera UP to world UP
+        cameraRef.current.up.lerp(new THREE.Vector3(0, 1, 0), 0.1);
+
+        controls.enabled = true;
+        controls.update();
+
+        // Hide weapon
+        if (weaponGroupRef.current) weaponGroupRef.current.visible = false;
       }
 
-      // Update clouds and birds rotation if global rotation is on and not in flight mode (or keep passive objects moving anyway)
-      if (isRotatingRef.current) {
-          cloudsRef.current!.rotation.y += 0.002;
-          
-          if (birdPivotsRef.current) {
-            const time = Date.now() * 0.01;
-            birdPivotsRef.current.forEach((pivot, index) => {
-              pivot.rotation.y += 0.004 + index * 0.0005;
-              if (pivot.parent) {
-                pivot.parent.rotation.x += 0.0002;
-              }
-              
-              pivot.children.forEach((bird, bIndex) => {
-                const lw = bird.getObjectByName("lw");
-                const rw = bird.getObjectByName("rw");
-                if (lw && rw) {
-                  const flap = Math.sin(time * 1.5 + bIndex) * 0.4;
-                  lw.rotation.z = flap;
-                  rw.rotation.z = -flap;
-                }
-              });
-            });
+      // Clouds drift (always, very slow)
+      if (cloudsRef.current && !fpsModeRef.current) {
+        cloudsRef.current.rotation.y += 0.0004;
+      }
+      
+      if (birdPivotsRef.current) {
+        const time = Date.now() * 0.01;
+        birdPivotsRef.current.forEach((pivot, index) => {
+          pivot.rotation.y += 0.004 + index * 0.0005;
+          if (pivot.parent) {
+            pivot.parent.rotation.x += 0.0002;
           }
+          
+          pivot.children.forEach((bird, bIndex) => {
+            const lw = bird.getObjectByName("lw");
+            const rw = bird.getObjectByName("rw");
+            if (lw && rw) {
+              const flap = Math.sin(time * 1.5 + bIndex) * 0.4;
+              lw.rotation.z = flap;
+              rw.rotation.z = -flap;
+            }
+          });
+        });
       }
 
       // (Disabled starfield rotation per user request)
@@ -868,27 +1046,17 @@ export default function App() {
         weatherParticlesRef.current.geometry.attributes.position.needsUpdate = true;
       }
 
-      renderer.render(scene, camera);
+      if (cameraRef.current) {
+        renderer.render(scene, cameraRef.current);
+      }
     };
     animate();
 
-    const handleResize = () => {
-      const aspect = window.innerWidth / window.innerHeight;
-      const frustumSize = 18;
-      
-      const orthoCam = camera as THREE.OrthographicCamera;
-      orthoCam.left = -frustumSize * aspect / 2;
-      orthoCam.right = frustumSize * aspect / 2;
-      orthoCam.top = frustumSize / 2;
-      orthoCam.bottom = -frustumSize / 2;
-      
-      orthoCam.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-    };
-    window.addEventListener('resize', handleResize);
+
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('click', handleCanvasClick);
       cancelAnimationFrame(frameId);
       renderer.dispose();
       renderer.domElement.remove();
@@ -1207,36 +1375,131 @@ export default function App() {
             {/* Separator */}
             <div className="w-px h-10 bg-white/20 mx-1 md:mx-2 hidden md:block"></div>
 
-            {/* Flight Toggle Button */}
-            <button
-              onClick={() => {
-                if (flightMode) {
-                  setFlightMode(false);
-                  setCameraView('orbit');
-                } else {
-                  setFlightMode(true);
-                  setCameraView('third-person');
-                }
-              }}
-              className={`flex flex-col items-center justify-center px-4 py-2 md:py-3 rounded-xl transition-all duration-300 ${
-                flightMode 
-                  ? 'bg-emerald-500/50 text-white shadow-inner scale-95 border border-emerald-400/50' 
-                  : 'text-slate-200 hover:bg-white/10 hover:text-white border border-transparent'
-              }`}
-            >
-              <Plane size={18} className="md:w-6 md:h-6 mb-1" />
-              <span className="text-[9px] md:text-xs font-bold uppercase tracking-wider hidden sm:block">
-                {flightMode ? 'EXIT CONTROL' : 'FLY'}
-              </span>
-            </button>
-          </motion.div>
-          
-          <div className={`text-[9px] md:text-xs font-black uppercase tracking-[0.3em] text-white/50`}>
-            {weather} mode
-          </div>
-        </div>
-      </div>
+            {/* Flight/FPS Controls */}
+            <div className="flex gap-1 md:gap-3">
+              {!fpsMode ? (
+                <button
+                  onClick={() => {
+                    if (flightMode) {
+                      setFlightMode(false);
+                      setCameraView('orbit');
+                    } else {
+                      setFlightMode(true);
+                      setCameraView('third-person');
+                    }
+                  }}
+                  className={`flex flex-col items-center justify-center px-4 py-2 md:py-3 rounded-xl transition-all duration-300 ${
+                    flightMode 
+                      ? 'bg-emerald-500/50 text-white shadow-inner scale-95 border border-emerald-400/50' 
+                      : 'text-slate-200 hover:bg-white/10 hover:text-white border border-transparent'
+                  }`}
+                >
+                  <Plane size={18} className="md:w-6 md:h-6 mb-1" />
+                  <span className="text-[9px] md:text-xs font-bold uppercase tracking-wider hidden sm:block">
+                    {flightMode ? 'EXIT CONTROL' : 'FLY'}
+                  </span>
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    setFpsMode(false);
+                    setShowFpsInstructions(false);
+                    setCameraView('orbit');
+                    characterVelocityRef.current.set(0, 0, 0);
+                    if (document.pointerLockElement) {
+                      document.exitPointerLock();
+                    }
+                  }}
+                  className="flex flex-col items-center justify-center px-4 py-2 md:py-3 rounded-xl bg-orange-500/50 text-white border border-orange-400/50 transition-all"
+                >
+                  <RotateCcw size={18} className="md:w-6 md:h-6 mb-1" />
+                  <span className="text-[9px] md:text-xs font-bold uppercase tracking-wider hidden sm:block">
+                    EXIT FPS
+                  </span>
+                </button>
+              )}
 
+              {flightMode && !fpsMode && (
+                <motion.button
+                  initial={{ opacity: 0, scale: 0.5 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  onClick={() => {
+                    // Transition to FPS at airplane's location
+                    if (airplanePivotRef.current) {
+                      const airplane = airplanePivotRef.current.children[0];
+                      if (airplane) {
+                        const worldPos = new THREE.Vector3();
+                        airplane.getWorldPosition(worldPos);
+                        characterPosRef.current.copy(worldPos);
+                        
+                        // Give some initial velocity based on plane forward
+                        const worldQuat = new THREE.Quaternion();
+                        airplane.getWorldQuaternion(worldQuat);
+                        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(worldQuat);
+                        characterVelocityRef.current.copy(forward.multiplyScalar(0.1));
+                        
+                        // Reset camera orientation for fresh landing
+                        fpsYawRef.current = 0;
+                        fpsPitchRef.current = 0;
+
+                        setFpsMode(true);
+                        setShowFpsInstructions(true);
+                        setFlightMode(false);
+                      }
+                    }
+                  }}
+                  className="flex flex-col items-center justify-center px-4 py-2 md:py-3 rounded-xl bg-amber-500/50 text-white border border-amber-400/50 hover:bg-amber-500 transition-all shadow-lg"
+                >
+                  <Parachute size={24} className="mb-1" />
+                  <span className="text-[9px] md:text-xs font-bold uppercase tracking-wider hidden sm:block">
+                    JUMP (FPS)
+                  </span>
+                </motion.button>
+              )}
+            </div>
+          </motion.div>
+        </div>
+
+        {/* FPS HUD & Instructions */}
+        <AnimatePresence>
+          {fpsMode && (
+            <>
+              {/* Permanent Crosshair */}
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-50">
+                <div className="w-1.5 h-1.5 bg-white/70 rounded-full shadow-[0_0_8px_rgba(255,255,255,0.8)]"></div>
+              </div>
+
+              {/* Instructions Overlay (Fades in) */}
+              <AnimatePresence>
+                {showFpsInstructions && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0 }}
+                    onClick={() => setShowFpsInstructions(false)}
+                    className="absolute inset-0 flex items-center justify-center pointer-events-none z-40"
+                  >
+                    <div className="bg-black/60 backdrop-blur-md p-8 rounded-[2.5rem] border border-white/20 text-center pointer-events-auto cursor-pointer hover:bg-black/70 transition-colors shadow-2xl">
+                      <h3 className="text-white text-2xl font-black mb-6 uppercase tracking-tighter">On Foot Controls</h3>
+                      <div className="grid grid-cols-2 gap-x-12 gap-y-3 text-white/90 text-sm mb-6">
+                        <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">W S A D</div>
+                        <div className="text-left py-1">Walk</div>
+                        <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">MOUSE</div>
+                        <div className="text-left py-1">Look Around</div>
+                        <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">SPACE</div>
+                        <div className="text-left py-1">Jump</div>
+                        <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">CLICK</div>
+                        <div className="text-left font-bold py-1">Lock Cursor</div>
+                      </div>
+                      <div className="text-[10px] text-white/40 uppercase tracking-widest font-bold">Click anywhere to dismiss</div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }
