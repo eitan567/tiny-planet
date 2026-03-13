@@ -222,11 +222,65 @@ export default function App() {
     // --- Atmosphere Glow ---
     // Expanded radius so the airplane (radius Planet + 1.2 = 6.2) is fully inside but not too far out
     const atmosGeo = new THREE.SphereGeometry(PLANET_RADIUS * 1.3, 64, 64);
-    const atmosMat = new THREE.MeshBasicMaterial({
-      color: 0x4aa6ff,
+    
+    // Direction the sun is located (for shader and later logic)
+    const sunDir = new THREE.Vector3(10, 15, 10).normalize();
+
+    const atmosMat = new THREE.ShaderMaterial({
+      uniforms: {
+        sunDirection: { value: sunDir },
+        atmosphereColor: { value: new THREE.Color(0x4aa6ff) },
+        sunsetTint: { value: new THREE.Color(0xff8844) }
+      },
+      vertexShader: `
+        varying vec3 vNormal;
+        varying vec3 vPositionNormal;
+        void main() {
+          vNormal = normalize(normalMatrix * normal);
+          // Pass the raw normal for world-space calculations in fragment
+          vPositionNormal = normalize((modelMatrix * vec4(normal, 0.0)).xyz);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 sunDirection;
+        uniform vec3 atmosphereColor;
+        uniform vec3 sunsetTint;
+        
+        varying vec3 vNormal;
+        varying vec3 vPositionNormal;
+        
+        void main() {
+          // Calculate rim lighting (halo effect from outside)
+          vec3 viewDirection = vec3(0.0, 0.0, 1.0);
+          float rimDot = abs(dot(vNormal, viewDirection));
+          float rimIntensity = pow(1.0 - rimDot, 3.0);
+          
+          // Calculate day/night transition
+          float sunDot = dot(vPositionNormal, sunDirection);
+          
+          // Day side is bright (1.0), night side is dark (0.0)
+          float dayFactor = smoothstep(-0.2, 0.5, sunDot);
+          
+          // Sunset/sunrise rim tinting
+          float sunsetFactor = smoothstep(-0.2, 0.2, sunDot) - smoothstep(0.2, 0.6, sunDot);
+          vec3 baseColor = mix(atmosphereColor, sunsetTint, sunsetFactor * 0.8);
+          
+          // Make the day sky brighter/whiter when looking straight down into the atmosphere
+          float skyBrightness = dayFactor * rimDot;
+          vec3 finalColor = mix(baseColor, vec3(0.8, 0.9, 1.0), skyBrightness * 0.4);
+          
+          // Opacity combines day sky thickness and edge halo
+          float skyOpacity = dayFactor * 0.75; // Bright, solid day sky
+          float haloOpacity = rimIntensity * (dayFactor * 0.8 + 0.2); // Outer glowing edge
+          
+          float finalOpacity = max(skyOpacity, haloOpacity);
+          
+          gl_FragColor = vec4(finalColor, finalOpacity);
+        }
+      `,
       transparent: true,
-      opacity: 0.1,
-      blending: THREE.AdditiveBlending,
+      blending: THREE.NormalBlending, // Normal blending hides stars behind the day sky
       side: THREE.BackSide, // BackSide helps create a rim-glow effect from the outside
       depthWrite: false
     });
@@ -246,8 +300,7 @@ export default function App() {
     });
     houseWindowMaterialRef.current = windowMatNight; // For any backward compatibility check, though not strictly needed anymore
 
-    // Direction the sun is located
-    const sunDir = new THREE.Vector3(10, 15, 10).normalize();
+    // Variables already defined above: sunDir
 
     const addTree = (pos: THREE.Vector3) => {
       // Adjust position to terrain height
