@@ -7,12 +7,20 @@ import { motion, AnimatePresence } from 'motion/react';
 // --- Types ---
 type Weather = 'clear' | 'rain' | 'snow' | 'windy';
 
+declare global {
+  interface Window {
+    render_game_to_text?: () => string;
+  }
+}
+
 // --- Constants ---
 const PLANET_RADIUS = 5;
 const TREE_COUNT = 180;
 const HOUSE_COUNT = 45;
 const CLOUD_COUNT = 30;
 const WATER_LEVEL = 0.998; // Relative to PLANET_RADIUS
+const AUTO_FIRE_START_DELAY_MS = 280;
+const AUTO_FIRE_INTERVAL_MS = 120;
 
 // --- Helper Functions ---
 const getTerrainHeight = (v: THREE.Vector3) => {
@@ -38,6 +46,37 @@ const getTerrainHeight = (v: THREE.Vector3) => {
   }
   
   return d; 
+};
+
+const disposeSceneObject = (object: THREE.Object3D) => {
+  object.traverse(child => {
+    if (!(child instanceof THREE.Mesh)) return;
+    child.geometry.dispose();
+    if (Array.isArray(child.material)) {
+      child.material.forEach(material => material.dispose());
+      return;
+    }
+    child.material.dispose();
+  });
+};
+
+const getStableSurfaceDirection = (up: THREE.Vector3, preferred?: THREE.Vector3) => {
+  const candidates = [
+    preferred,
+    new THREE.Vector3(0, 1, 0),
+    new THREE.Vector3(0, 0, 1),
+    new THREE.Vector3(1, 0, 0),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const projected = candidate.clone().projectOnPlane(up);
+    if (projected.lengthSq() > 1e-6) {
+      return projected.normalize();
+    }
+  }
+
+  return new THREE.Vector3(1, 0, 0);
 };
 
 export default function App() {
@@ -134,8 +173,21 @@ export default function App() {
   const characterPosRef = useRef(new THREE.Vector3());
   const characterQuatRef = useRef(new THREE.Quaternion());
   const characterVelocityRef = useRef(new THREE.Vector3());
-  const fpsYawRef = useRef(0);
+  const fpsForwardRef = useRef(new THREE.Vector3(0, 0, -1));
   const fpsPitchRef = useRef(0);
+
+  // Shooting Refs
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const smokeParticlesRef = useRef<{ mesh: THREE.Mesh; velocity: THREE.Vector3; life: number; maxLife: number }[]>([]);
+  const bulletTracersRef = useRef<{ mesh: THREE.Mesh; velocity: THREE.Vector3; life: number; maxLife: number }[]>([]);
+  const decalsRef = useRef<THREE.Object3D[]>([]);
+  const muzzleFlashRef = useRef<THREE.PointLight | null>(null);
+  const recoilRef = useRef(0);
+  const shotsFiredRef = useRef(0);
+  const isShootPressedRef = useRef(false);
+  const longPressTriggeredRef = useRef(false);
+  const autoFireTimeoutRef = useRef<number | null>(null);
+  const autoFireIntervalRef = useRef<number | null>(null);
 
   useEffect(() => { flightModeRef.current = flightMode; }, [flightMode]);
   useEffect(() => { cameraViewRef.current = cameraView; }, [cameraView]);
@@ -155,7 +207,12 @@ export default function App() {
     const handleKeyUp = (e: KeyboardEvent) => { keysRef.current[e.code] = false; };
     const handleMouseMove = (e: MouseEvent) => {
       if (fpsModeRef.current) {
-        fpsYawRef.current -= e.movementX * 0.002;
+        const up = characterPosRef.current.lengthSq() > 0
+          ? characterPosRef.current.clone().normalize()
+          : new THREE.Vector3(0, 1, 0);
+        const surfaceForward = getStableSurfaceDirection(up, fpsForwardRef.current);
+        surfaceForward.applyAxisAngle(up, -e.movementX * 0.002).normalize();
+        fpsForwardRef.current.copy(surfaceForward);
         fpsPitchRef.current -= e.movementY * 0.002;
         fpsPitchRef.current = THREE.MathUtils.clamp(fpsPitchRef.current, -Math.PI / 2.2, Math.PI / 2.2);
       }
@@ -253,12 +310,259 @@ export default function App() {
     };
     window.addEventListener('resize', handleResize);
 
-    const handleCanvasClick = () => {
-      if (fpsModeRef.current) {
-        renderer.domElement.requestPointerLock();
+    // --- Muzzle Flash Light ---
+    const muzzleFlash = new THREE.PointLight(0xffaa33, 0, 2);
+    perspCamera.add(muzzleFlash);
+    muzzleFlash.position.set(0.06, -0.024, -0.15); // At barrel tip (scaled)
+    muzzleFlashRef.current = muzzleFlash;
+
+    // --- Shooting System ---
+    const smokeMaterial = new THREE.MeshBasicMaterial({ 
+      color: 0xaaaaaa, 
+      transparent: true, 
+      opacity: 0.6,
+      depthWrite: false 
+    });
+    const smokeGeo = new THREE.SphereGeometry(0.015, 6, 6);
+    const tracerGeo = new THREE.CylinderGeometry(0.003, 0.003, 0.18, 6);
+    tracerGeo.rotateX(Math.PI / 2);
+    const tracerMaterial = new THREE.MeshBasicMaterial({
+      color: 0xfff0b3,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    });
+
+    const decalOuterMaterial = new THREE.MeshStandardMaterial({
+      color: 0xd1d5db,
+      roughness: 1.0,
+      metalness: 0,
+      transparent: true,
+      opacity: 0.92,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+    });
+    const decalInnerMaterial = new THREE.MeshStandardMaterial({
+      color: 0x4b5563,
+      roughness: 1.0,
+      metalness: 0,
+      transparent: true,
+      opacity: 0.96,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -5,
+    });
+
+    const spawnSmoke = (position: THREE.Vector3, count: number, spread: number, speed: number) => {
+      for (let i = 0; i < count; i++) {
+        const smokeMesh = new THREE.Mesh(smokeGeo, smokeMaterial.clone());
+        smokeMesh.position.copy(position);
+        const scale = 0.5 + Math.random() * 1.0;
+        smokeMesh.scale.set(scale, scale, scale);
+        scene.add(smokeMesh);
+
+        const vel = new THREE.Vector3(
+          (Math.random() - 0.5) * spread,
+          (Math.random() - 0.5) * spread,
+          (Math.random() - 0.5) * spread
+        );
+        // Bias upward (away from planet center) 
+        const upDir = position.clone().normalize();
+        vel.add(upDir.multiplyScalar(speed));
+
+        smokeParticlesRef.current.push({
+          mesh: smokeMesh,
+          velocity: vel,
+          life: 0,
+          maxLife: 30 + Math.random() * 20
+        });
       }
     };
-    renderer.domElement.addEventListener('click', handleCanvasClick);
+
+    const clearAutoFire = () => {
+      if (autoFireTimeoutRef.current !== null) {
+        window.clearTimeout(autoFireTimeoutRef.current);
+        autoFireTimeoutRef.current = null;
+      }
+      if (autoFireIntervalRef.current !== null) {
+        window.clearInterval(autoFireIntervalRef.current);
+        autoFireIntervalRef.current = null;
+      }
+      isShootPressedRef.current = false;
+      longPressTriggeredRef.current = false;
+    };
+
+    const shoot = () => {
+      if (!fpsModeRef.current || !perspCameraRef.current || !sceneRef.current) return;
+      shotsFiredRef.current += 1;
+
+      const cam = perspCameraRef.current;
+
+      // Raycast from camera center
+      raycasterRef.current.setFromCamera(new THREE.Vector2(0, 0), cam);
+      
+      // Get all meshes to test against (planet, houses, trees, etc.)
+      const intersects = raycasterRef.current.intersectObjects(sceneRef.current.children, true);
+
+      // Filter: only allow hits on objects tagged as shootable
+      const hit = intersects.find(i => {
+        let obj: THREE.Object3D | null = i.object;
+        while (obj) {
+          if (obj === weaponGroupRef.current) return false;
+          if (obj === perspCameraRef.current) return false;
+          if (obj.userData.shootable) return true;
+          obj = obj.parent;
+        }
+        return false; // not tagged → ignore
+      });
+
+      // Muzzle flash
+      if (muzzleFlashRef.current) {
+        muzzleFlashRef.current.intensity = 3;
+      }
+
+      // Recoil
+      recoilRef.current = 1.0;
+
+      // Barrel smoke
+      const fireOrigin = new THREE.Vector3().copy(cam.position);
+      if (weaponGroupRef.current) {
+        // Get barrel tip world position
+        const barrelTip = new THREE.Vector3(0.2, -0.08, -0.4); // local barrel position
+        barrelTip.multiplyScalar(0.3); // account for weapon group scale
+        barrelTip.applyMatrix4(cam.matrixWorld);
+        fireOrigin.copy(barrelTip);
+        spawnSmoke(barrelTip, 3, 0.003, 0.002);
+      }
+
+      const targetPoint = hit?.point?.clone() ?? fireOrigin.clone().add(
+        raycasterRef.current.ray.direction.clone().multiplyScalar(12)
+      );
+      const tracerDirection = targetPoint.clone().sub(fireOrigin).normalize();
+      const tracerDistance = Math.max(0.25, fireOrigin.distanceTo(targetPoint));
+      const tracerSpeed = 0.3;
+      const tracer = new THREE.Mesh(tracerGeo, tracerMaterial.clone());
+      tracer.position.copy(fireOrigin).add(tracerDirection.clone().multiplyScalar(0.16));
+      tracer.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tracerDirection);
+      scene.add(tracer);
+      bulletTracersRef.current.push({
+        mesh: tracer,
+        velocity: tracerDirection.multiplyScalar(tracerSpeed),
+        life: 0,
+        maxLife: Math.max(4, Math.ceil(tracerDistance / tracerSpeed)),
+      });
+
+      if (hit && hit.point && hit.face) {
+        // --- Create Decal ---
+        const decal = new THREE.Group();
+        const outerCircle = new THREE.Mesh(
+          new THREE.CircleGeometry(0.008, 18),
+          decalOuterMaterial.clone()
+        );
+        const innerCircle = new THREE.Mesh(
+          new THREE.CircleGeometry(0.0034, 16),
+          decalInnerMaterial.clone()
+        );
+        innerCircle.position.z = 0.0005;
+        decal.add(outerCircle, innerCircle);
+
+        // Transform face normal from object-local to world space
+        const worldNormal = hit.face.normal.clone();
+        worldNormal.transformDirection(hit.object.matrixWorld);
+
+        // Position at hit point, slightly offset along world normal
+        decal.position.copy(hit.point).add(worldNormal.clone().multiplyScalar(0.002));
+
+        // Orient to face outward along the world-space surface normal
+        decal.lookAt(decal.position.clone().add(worldNormal));
+
+        scene.add(decal);
+        decalsRef.current.push(decal);
+
+        // Limit decals to 50
+        if (decalsRef.current.length > 50) {
+          const old = decalsRef.current.shift()!;
+          scene.remove(old);
+          disposeSceneObject(old);
+        }
+
+        // Impact smoke
+        spawnSmoke(hit.point.clone(), 5, 0.01, 0.005);
+      }
+    };
+
+    const startAutoFire = () => {
+      clearAutoFire();
+      isShootPressedRef.current = true;
+      autoFireTimeoutRef.current = window.setTimeout(() => {
+        if (!isShootPressedRef.current || document.pointerLockElement !== renderer.domElement) return;
+        longPressTriggeredRef.current = true;
+        shoot();
+        autoFireIntervalRef.current = window.setInterval(() => {
+          if (!isShootPressedRef.current || document.pointerLockElement !== renderer.domElement) {
+            clearAutoFire();
+            return;
+          }
+          shoot();
+        }, AUTO_FIRE_INTERVAL_MS);
+      }, AUTO_FIRE_START_DELAY_MS);
+    };
+
+    const handleCanvasPointerDown = (event: PointerEvent) => {
+      if (!fpsModeRef.current || event.button !== 0) return;
+      if (document.pointerLockElement !== renderer.domElement) {
+        renderer.domElement.requestPointerLock();
+        return;
+      }
+      startAutoFire();
+    };
+
+    const handleShootRelease = () => {
+      const shouldShootSingle =
+        fpsModeRef.current &&
+        isShootPressedRef.current &&
+        !longPressTriggeredRef.current &&
+        document.pointerLockElement === renderer.domElement;
+
+      clearAutoFire();
+
+      if (shouldShootSingle) {
+        shoot();
+      }
+    };
+
+    const handlePointerLockChange = () => {
+      if (document.pointerLockElement !== renderer.domElement) {
+        clearAutoFire();
+      }
+    };
+
+    window.render_game_to_text = () => JSON.stringify({
+      mode: fpsModeRef.current ? 'fps' : flightModeRef.current ? 'flight' : 'orbit',
+      weather: weatherRef.current,
+      cameraView: cameraViewRef.current,
+      pointerLocked: document.pointerLockElement === renderer.domElement,
+      autoFireActive: autoFireIntervalRef.current !== null,
+      shotsFired: shotsFiredRef.current,
+      bulletTracers: bulletTracersRef.current.length,
+      decals: decalsRef.current.length,
+      smokeParticles: smokeParticlesRef.current.length,
+      player: {
+        x: Number(characterPosRef.current.x.toFixed(3)),
+        y: Number(characterPosRef.current.y.toFixed(3)),
+        z: Number(characterPosRef.current.z.toFixed(3)),
+        speed: Number(characterVelocityRef.current.length().toFixed(3)),
+        forwardX: Number(fpsForwardRef.current.x.toFixed(3)),
+        forwardY: Number(fpsForwardRef.current.y.toFixed(3)),
+        forwardZ: Number(fpsForwardRef.current.z.toFixed(3)),
+      },
+    });
+
+    renderer.domElement.addEventListener('pointerdown', handleCanvasPointerDown);
+    window.addEventListener('pointerup', handleShootRelease);
+    window.addEventListener('pointercancel', handleShootRelease);
+    document.addEventListener('pointerlockchange', handlePointerLockChange);
 
     // --- Controls ---
     const controls = new OrbitControls(orthoCamera, renderer.domElement);
@@ -326,6 +630,7 @@ export default function App() {
     });
     const sphere = new THREE.Mesh(geometry, material);
     sphere.receiveShadow = true;
+    sphere.userData.shootable = true;
     planetGroup.add(sphere);
 
     // --- Water ---
@@ -434,6 +739,7 @@ export default function App() {
       if (displacement > 0.30) return; // No trees on snow peaks
 
       const tree = new THREE.Group();
+      tree.userData.shootable = true;
       const trunkGeo = new THREE.CylinderGeometry(0.03, 0.05, 0.3);
       const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5d2710 });
       const trunk = new THREE.Mesh(trunkGeo, trunkMat);
@@ -464,6 +770,7 @@ export default function App() {
       if (displacement > 0.28) return; // No houses on high peaks
 
       const house = new THREE.Group();
+      house.userData.shootable = true;
       const baseGeo = new THREE.BoxGeometry(0.3, 0.3, 0.3);
       const baseMat = new THREE.MeshStandardMaterial({ color: 0xfef3c7 });
       const base = new THREE.Mesh(baseGeo, baseMat);
@@ -574,6 +881,7 @@ export default function App() {
     airplanePivotRef.current = airplanePivot;
 
     const airplane = new THREE.Group();
+    airplane.userData.shootable = true;
     
     const fuselageGeo = new THREE.CylinderGeometry(0.06, 0.04, 0.5, 8);
     fuselageGeo.rotateX(Math.PI / 2);
@@ -807,28 +1115,26 @@ export default function App() {
 
         controls.enabled = false;
 
-        const up = characterPosRef.current.clone().normalize();
         const keys = keysRef.current;
+        const up = characterPosRef.current.clone().normalize();
+        const surfaceForward = getStableSurfaceDirection(up, fpsForwardRef.current);
+        fpsForwardRef.current.copy(surfaceForward);
+        const surfaceRight = new THREE.Vector3().crossVectors(surfaceForward, up).normalize();
 
         // Gravity
         const gravityForce = 0.006;
         const jumpImpulse = 0.15;
         characterVelocityRef.current.add(up.clone().multiplyScalar(-gravityForce));
 
-        // Character orientation on sphere
-        const baseQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), up);
-        const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), fpsYawRef.current);
-        const combinedQuat = baseQuat.clone().multiply(yawQuat);
-
         // Movement
         const moveDir = new THREE.Vector3();
-        if (keys['KeyW'] || keys['ArrowUp']) moveDir.z -= 1;
-        if (keys['KeyS'] || keys['ArrowDown']) moveDir.z += 1;
-        if (keys['KeyA'] || keys['ArrowLeft']) moveDir.x -= 1;
-        if (keys['KeyD'] || keys['ArrowRight']) moveDir.x += 1;
+        if (keys['KeyW'] || keys['ArrowUp']) moveDir.add(surfaceForward);
+        if (keys['KeyS'] || keys['ArrowDown']) moveDir.sub(surfaceForward);
+        if (keys['KeyA'] || keys['ArrowLeft']) moveDir.sub(surfaceRight);
+        if (keys['KeyD'] || keys['ArrowRight']) moveDir.add(surfaceRight);
         
         if (moveDir.lengthSq() > 0) {
-          moveDir.normalize().applyQuaternion(combinedQuat).multiplyScalar(0.08);
+          moveDir.normalize().multiplyScalar(0.08);
           characterPosRef.current.add(moveDir);
           
           // Weapon walk sway
@@ -850,20 +1156,21 @@ export default function App() {
         characterPosRef.current.add(characterVelocityRef.current);
 
         // Ground collision
-        const unitPos = characterPosRef.current.clone().normalize();
-        const terrainH = getTerrainHeight(unitPos);
+        const currentUp = characterPosRef.current.clone().normalize();
+        const unitPos = currentUp.clone();
+        const terrainH = getTerrainHeight(currentUp);
         const distFromCenter = characterPosRef.current.length();
         const targetRadius = PLANET_RADIUS + terrainH + 0.15;
         
         if (distFromCenter < targetRadius) {
           characterPosRef.current.setLength(targetRadius);
           
-          if (characterVelocityRef.current.dot(up) < 0) {
+          if (characterVelocityRef.current.dot(currentUp) < 0) {
             characterVelocityRef.current.set(0, 0, 0);
           }
 
           if (keys['Space']) {
-            characterVelocityRef.current.add(up.clone().multiplyScalar(jumpImpulse));
+            characterVelocityRef.current.add(currentUp.clone().multiplyScalar(jumpImpulse));
           }
         }
 
@@ -871,10 +1178,15 @@ export default function App() {
         if (weaponGroupRef.current) weaponGroupRef.current.visible = true;
         cameraRef.current.position.copy(characterPosRef.current);
         
-        // Orientation: Surface + Yaw + Pitch
-        const pitchQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), fpsPitchRef.current);
-        const finalCameraQuat = combinedQuat.clone().multiply(pitchQuat);
-        cameraRef.current.quaternion.copy(finalCameraQuat);
+        // Orientation: stable tangent heading + local pitch
+        const groundedUp = characterPosRef.current.clone().normalize();
+        const groundedForward = getStableSurfaceDirection(groundedUp, fpsForwardRef.current);
+        fpsForwardRef.current.copy(groundedForward);
+        const groundedRight = new THREE.Vector3().crossVectors(groundedForward, groundedUp).normalize();
+        const lookDirection = groundedForward.clone().applyAxisAngle(groundedRight, fpsPitchRef.current).normalize();
+        cameraRef.current.up.copy(groundedUp);
+        cameraRef.current.lookAt(cameraRef.current.position.clone().add(lookDirection));
+        characterQuatRef.current.copy(cameraRef.current.quaternion);
 
       } else if (flightModeRef.current) {
         // --- FLIGHT MODE CAMERA ---
@@ -1046,6 +1358,61 @@ export default function App() {
         weatherParticlesRef.current.geometry.attributes.position.needsUpdate = true;
       }
 
+      // --- Shooting Effects Update ---
+      // Smoke particles
+      for (let i = smokeParticlesRef.current.length - 1; i >= 0; i--) {
+        const p = smokeParticlesRef.current[i];
+        p.life++;
+        p.mesh.position.add(p.velocity);
+        p.velocity.multiplyScalar(0.94); // Drag
+        
+        // Expand and fade
+        const t = p.life / p.maxLife;
+        const scale = (0.5 + t * 2.0);
+        p.mesh.scale.set(scale, scale, scale);
+        (p.mesh.material as THREE.MeshBasicMaterial).opacity = 0.6 * (1 - t);
+
+        if (p.life >= p.maxLife) {
+          scene.remove(p.mesh);
+          p.mesh.geometry.dispose();
+          (p.mesh.material as THREE.Material).dispose();
+          smokeParticlesRef.current.splice(i, 1);
+        }
+      }
+
+      // Bullet tracers
+      for (let i = bulletTracersRef.current.length - 1; i >= 0; i--) {
+        const tracer = bulletTracersRef.current[i];
+        tracer.life++;
+        tracer.mesh.position.add(tracer.velocity);
+
+        const t = tracer.life / tracer.maxLife;
+        tracer.mesh.scale.set(1, 1, 1 + t * 0.6);
+        (tracer.mesh.material as THREE.MeshBasicMaterial).opacity = 0.95 * (1 - t);
+
+        if (tracer.life >= tracer.maxLife) {
+          scene.remove(tracer.mesh);
+          tracer.mesh.geometry.dispose();
+          (tracer.mesh.material as THREE.Material).dispose();
+          bulletTracersRef.current.splice(i, 1);
+        }
+      }
+
+      // Muzzle flash decay
+      if (muzzleFlashRef.current && muzzleFlashRef.current.intensity > 0) {
+        muzzleFlashRef.current.intensity *= 0.7;
+        if (muzzleFlashRef.current.intensity < 0.05) muzzleFlashRef.current.intensity = 0;
+      }
+
+      // Weapon recoil recovery
+      if (recoilRef.current > 0.01 && weaponGroupRef.current) {
+        recoilRef.current *= 0.85;
+        weaponGroupRef.current.rotation.x = -recoilRef.current * 0.15;
+      } else if (weaponGroupRef.current) {
+        weaponGroupRef.current.rotation.x = 0;
+        recoilRef.current = 0;
+      }
+
       if (cameraRef.current) {
         renderer.render(scene, cameraRef.current);
       }
@@ -1056,8 +1423,33 @@ export default function App() {
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      window.removeEventListener('click', handleCanvasClick);
+      renderer.domElement.removeEventListener('pointerdown', handleCanvasPointerDown);
+      window.removeEventListener('pointerup', handleShootRelease);
+      window.removeEventListener('pointercancel', handleShootRelease);
+      document.removeEventListener('pointerlockchange', handlePointerLockChange);
       cancelAnimationFrame(frameId);
+      clearAutoFire();
+      delete window.render_game_to_text;
+      
+      // Clean up shooting effects
+      smokeParticlesRef.current.forEach(p => {
+        scene.remove(p.mesh);
+        p.mesh.geometry.dispose();
+        (p.mesh.material as THREE.Material).dispose();
+      });
+      smokeParticlesRef.current = [];
+      bulletTracersRef.current.forEach(tracer => {
+        scene.remove(tracer.mesh);
+        tracer.mesh.geometry.dispose();
+        (tracer.mesh.material as THREE.Material).dispose();
+      });
+      bulletTracersRef.current = [];
+      decalsRef.current.forEach(d => {
+        scene.remove(d);
+        disposeSceneObject(d);
+      });
+      decalsRef.current = [];
+
       renderer.dispose();
       renderer.domElement.remove();
     };
@@ -1439,7 +1831,9 @@ export default function App() {
                         characterVelocityRef.current.copy(forward.multiplyScalar(0.1));
                         
                         // Reset camera orientation for fresh landing
-                        fpsYawRef.current = 0;
+                        fpsForwardRef.current.copy(
+                          getStableSurfaceDirection(worldPos.clone().normalize(), forward)
+                        );
                         fpsPitchRef.current = 0;
 
                         setFpsMode(true);
@@ -1489,7 +1883,9 @@ export default function App() {
                         <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">SPACE</div>
                         <div className="text-left py-1">Jump</div>
                         <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">CLICK</div>
-                        <div className="text-left font-bold py-1">Lock Cursor</div>
+                        <div className="text-left py-1">Lock Cursor / Single Shot</div>
+                        <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">HOLD CLICK</div>
+                        <div className="text-left font-bold py-1">Auto Fire</div>
                       </div>
                       <div className="text-[10px] text-white/40 uppercase tracking-widest font-bold">Click anywhere to dismiss</div>
                     </div>
