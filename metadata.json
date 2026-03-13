@@ -1,0 +1,5 @@
+{
+  "name": "Tiny Planet Explorer",
+  "description": "A miniature 3D rotating world with trees, houses, clouds, day/night cycles, and weather effects.",
+  "requestFramePermissions": []
+}
