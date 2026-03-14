@@ -6,6 +6,13 @@ import { motion, AnimatePresence } from 'motion/react';
 
 // --- Types ---
 type Weather = 'clear' | 'rain' | 'snow' | 'windy';
+type ObstacleShape =
+  | { type: 'sphere'; center: THREE.Vector3; radius: number }
+  | { type: 'box'; center: THREE.Vector3; halfSize: THREE.Vector3 };
+type ObstacleCollider = {
+  object: THREE.Object3D;
+  shapes: ObstacleShape[];
+};
 
 declare global {
   interface Window {
@@ -21,6 +28,10 @@ const CLOUD_COUNT = 30;
 const WATER_LEVEL = 0.998; // Relative to PLANET_RADIUS
 const AUTO_FIRE_START_DELAY_MS = 280;
 const AUTO_FIRE_INTERVAL_MS = 120;
+const PLAYER_COLLISION_RADIUS = 0.18;
+const GRENADE_FUSE_FRAMES = 96;
+const GRENADE_ARM_FRAMES = 10;
+const GRENADE_THROW_COOLDOWN_FRAMES = 20;
 
 // --- Helper Functions ---
 const getTerrainHeight = (v: THREE.Vector3) => {
@@ -77,6 +88,19 @@ const getStableSurfaceDirection = (up: THREE.Vector3, preferred?: THREE.Vector3)
   }
 
   return new THREE.Vector3(1, 0, 0);
+};
+
+const getBoxSignedDistance = (point: THREE.Vector3, center: THREE.Vector3, halfSize: THREE.Vector3) => {
+  const dx = Math.abs(point.x - center.x) - halfSize.x;
+  const dy = Math.abs(point.y - center.y) - halfSize.y;
+  const dz = Math.abs(point.z - center.z) - halfSize.z;
+  const outside = new THREE.Vector3(
+    Math.max(dx, 0),
+    Math.max(dy, 0),
+    Math.max(dz, 0)
+  ).length();
+  const inside = Math.min(Math.max(dx, Math.max(dy, dz)), 0);
+  return outside + inside;
 };
 
 export default function App() {
@@ -161,6 +185,7 @@ export default function App() {
   const particleFallProgressRef = useRef<Float32Array>(new Float32Array(0)); // 0 = at cloud, 1 = at surface
   const particleOffsetRef = useRef<Float32Array>(new Float32Array(0)); // [latX, latZ, latX, latZ...]
   const celestialGroupRef = useRef<THREE.Group | null>(null);
+  const obstacleCollidersRef = useRef<ObstacleCollider[]>([]);
 
   // Flight Interaction Refs
   const keysRef = useRef<{ [key: string]: boolean }>({});
@@ -168,6 +193,8 @@ export default function App() {
   const flightModeRef = useRef(flightMode);
   const cameraViewRef = useRef(cameraView);
   const fpsModeRef = useRef(fpsMode);
+  const activeModeRef = useRef<'orbit' | 'flight' | 'fps'>('orbit');
+  const shouldResetOrbitCameraRef = useRef(false);
 
   // FPS Character Refs
   const characterPosRef = useRef(new THREE.Vector3());
@@ -180,14 +207,20 @@ export default function App() {
   const raycasterRef = useRef(new THREE.Raycaster());
   const smokeParticlesRef = useRef<{ mesh: THREE.Mesh; velocity: THREE.Vector3; life: number; maxLife: number }[]>([]);
   const bulletTracersRef = useRef<{ mesh: THREE.Mesh; velocity: THREE.Vector3; life: number; maxLife: number }[]>([]);
+  const grenadesRef = useRef<{ mesh: THREE.Mesh; velocity: THREE.Vector3; life: number }[]>([]);
+  const grenadeBurstsRef = useRef<{ mesh: THREE.Mesh; life: number; maxLife: number }[]>([]);
   const decalsRef = useRef<THREE.Object3D[]>([]);
   const muzzleFlashRef = useRef<THREE.PointLight | null>(null);
   const recoilRef = useRef(0);
+  const weaponGroundAvoidanceRef = useRef(0);
   const shotsFiredRef = useRef(0);
   const isShootPressedRef = useRef(false);
   const longPressTriggeredRef = useRef(false);
   const autoFireTimeoutRef = useRef<number | null>(null);
   const autoFireIntervalRef = useRef<number | null>(null);
+  const grenadeThrowRequestedRef = useRef(false);
+  const grenadeCooldownRef = useRef(0);
+  const torchActiveRef = useRef(false);
 
   useEffect(() => { flightModeRef.current = flightMode; }, [flightMode]);
   useEffect(() => { cameraViewRef.current = cameraView; }, [cameraView]);
@@ -203,7 +236,12 @@ export default function App() {
 
   // Keyboard listeners for flight
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => { keysRef.current[e.code] = true; };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      keysRef.current[e.code] = true;
+      if (fpsModeRef.current && e.code === 'KeyG' && !e.repeat) {
+        grenadeThrowRequestedRef.current = true;
+      }
+    };
     const handleKeyUp = (e: KeyboardEvent) => { keysRef.current[e.code] = false; };
     const handleMouseMove = (e: MouseEvent) => {
       if (fpsModeRef.current) {
@@ -260,7 +298,7 @@ export default function App() {
 
     // --- Weapon View-model (for FPS) ---
     const weaponGroup = new THREE.Group();
-    weaponGroup.scale.set(0.3, 0.3, 0.3); // Scale down for tiny planet proportions
+    weaponGroup.scale.set(0.27, 0.27, 0.27); // Slightly smaller so it stays clear of the ground line
     // Gun body
     const gunBody = new THREE.Mesh(
       new THREE.BoxGeometry(0.08, 0.12, 0.4),
@@ -277,6 +315,183 @@ export default function App() {
     barrel.rotation.x = Math.PI / 2;
     barrel.position.set(0.2, -0.08, -0.4);
     weaponGroup.add(barrel);
+
+    const makeOverlayStandardMaterial = (params: THREE.MeshStandardMaterialParameters) => {
+      const material = new THREE.MeshStandardMaterial(params);
+      material.depthTest = false;
+      return material;
+    };
+
+    const torchGroup = new THREE.Group();
+    torchGroup.position.set(-0.3, -0.32, -0.39);
+    torchGroup.rotation.set(0.18, 0.08, 0.1);
+    torchGroup.scale.setScalar(0.52);
+    torchGroup.visible = false;
+
+    const torchHandle = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.016, 0.02, 0.58, 10),
+      makeOverlayStandardMaterial({ color: 0x6b4327, roughness: 0.96 })
+    );
+    torchHandle.rotation.z = -0.04;
+    torchHandle.position.set(0.014, 0.06, 0);
+    torchHandle.renderOrder = 28;
+    torchGroup.add(torchHandle);
+
+    const torchHeadWrap = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.034, 0.03, 0.1, 10),
+      makeOverlayStandardMaterial({ color: 0x28150d, roughness: 0.88, emissive: 0x120602, emissiveIntensity: 0.35 })
+    );
+    torchHeadWrap.position.set(0.014, 0.34, 0.002);
+    torchHeadWrap.renderOrder = 29;
+    torchGroup.add(torchHeadWrap);
+
+    const torchCoalHead = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.024, 0.03, 0.06, 10),
+      makeOverlayStandardMaterial({ color: 0x15110f, roughness: 0.7, emissive: 0x2a1204, emissiveIntensity: 0.35 })
+    );
+    torchCoalHead.position.set(0.014, 0.39, 0.002);
+    torchCoalHead.renderOrder = 30;
+    torchGroup.add(torchCoalHead);
+
+    const torchFlameCore = new THREE.Mesh(
+      new THREE.SphereGeometry(0.018, 12, 12),
+      new THREE.MeshBasicMaterial({
+        color: 0xfff1c2,
+        transparent: true,
+        opacity: 0.6,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+      })
+    );
+    torchFlameCore.position.set(0.014, 0.47, 0.006);
+    torchFlameCore.renderOrder = 31;
+    torchGroup.add(torchFlameCore);
+
+    const torchFlameHalo = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        color: 0xffa13d,
+        transparent: true,
+        opacity: 0.28,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+      })
+    );
+    torchFlameHalo.position.set(0.014, 0.5, 0.006);
+    torchFlameHalo.scale.set(0.12, 0.24, 1);
+    torchFlameHalo.renderOrder = 31;
+    torchGroup.add(torchFlameHalo);
+
+    const buildParticleSprite = (innerColor: string, outerColor: string) => {
+      const spriteCanvas = document.createElement('canvas');
+      spriteCanvas.width = 128;
+      spriteCanvas.height = 128;
+      const spriteContext = spriteCanvas.getContext('2d');
+
+      if (spriteContext) {
+        const gradient = spriteContext.createRadialGradient(64, 64, 8, 64, 64, 64);
+        gradient.addColorStop(0, innerColor);
+        gradient.addColorStop(0.42, outerColor);
+        gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        spriteContext.fillStyle = gradient;
+        spriteContext.fillRect(0, 0, 128, 128);
+      }
+
+      const spriteTexture = new THREE.CanvasTexture(spriteCanvas);
+      spriteTexture.colorSpace = THREE.SRGBColorSpace;
+      return spriteTexture;
+    };
+
+    const outerFlameSprite = buildParticleSprite('rgba(255, 210, 120, 1)', 'rgba(255, 94, 24, 0.94)');
+    const innerFlameSprite = buildParticleSprite('rgba(255, 253, 240, 1)', 'rgba(255, 207, 104, 0.9)');
+    const smokeSprite = buildParticleSprite('rgba(214, 214, 214, 0.5)', 'rgba(58, 58, 58, 0.16)');
+    const torchFlameHaloMaterial = torchFlameHalo.material as THREE.SpriteMaterial;
+    torchFlameHaloMaterial.map = outerFlameSprite;
+    torchFlameHaloMaterial.alphaMap = outerFlameSprite;
+    torchFlameHaloMaterial.needsUpdate = true;
+
+    const outerFlameParticleCount = 96;
+    const outerFlameSeeds = Float32Array.from({ length: outerFlameParticleCount }, () => Math.random());
+    const outerFlamePositions = new Float32Array(outerFlameParticleCount * 3);
+    const outerFlameColors = new Float32Array(outerFlameParticleCount * 3);
+    const outerFlameGeometry = new THREE.BufferGeometry();
+    outerFlameGeometry.setAttribute('position', new THREE.BufferAttribute(outerFlamePositions, 3));
+    outerFlameGeometry.setAttribute('color', new THREE.BufferAttribute(outerFlameColors, 3));
+    const outerFlameParticles = new THREE.Points(
+      outerFlameGeometry,
+      new THREE.PointsMaterial({
+        size: 38,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.76,
+        map: outerFlameSprite,
+        alphaMap: outerFlameSprite,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: false,
+      })
+    );
+    outerFlameParticles.renderOrder = 32;
+    outerFlameParticles.frustumCulled = false;
+    torchGroup.add(outerFlameParticles);
+
+    const innerFlameParticleCount = 44;
+    const innerFlameSeeds = Float32Array.from({ length: innerFlameParticleCount }, () => Math.random());
+    const innerFlamePositions = new Float32Array(innerFlameParticleCount * 3);
+    const innerFlameColors = new Float32Array(innerFlameParticleCount * 3);
+    const innerFlameGeometry = new THREE.BufferGeometry();
+    innerFlameGeometry.setAttribute('position', new THREE.BufferAttribute(innerFlamePositions, 3));
+    innerFlameGeometry.setAttribute('color', new THREE.BufferAttribute(innerFlameColors, 3));
+    const innerFlameParticles = new THREE.Points(
+      innerFlameGeometry,
+      new THREE.PointsMaterial({
+        size: 24,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.86,
+        map: innerFlameSprite,
+        alphaMap: innerFlameSprite,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: false,
+      })
+    );
+    innerFlameParticles.renderOrder = 33;
+    innerFlameParticles.frustumCulled = false;
+    torchGroup.add(innerFlameParticles);
+
+    const smokeParticleCount = 28;
+    const smokeSeeds = Float32Array.from({ length: smokeParticleCount }, () => Math.random());
+    const smokePositions = new Float32Array(smokeParticleCount * 3);
+    const smokeColors = new Float32Array(smokeParticleCount * 3);
+    const smokeGeometry = new THREE.BufferGeometry();
+    smokeGeometry.setAttribute('position', new THREE.BufferAttribute(smokePositions, 3));
+    smokeGeometry.setAttribute('color', new THREE.BufferAttribute(smokeColors, 3));
+    const smokeParticles = new THREE.Points(
+      smokeGeometry,
+      new THREE.PointsMaterial({
+        size: 40,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.3,
+        map: smokeSprite,
+        alphaMap: smokeSprite,
+        depthWrite: false,
+        depthTest: false,
+        sizeAttenuation: false,
+      })
+    );
+    smokeParticles.renderOrder = 34;
+    smokeParticles.frustumCulled = false;
+    torchGroup.add(smokeParticles);
+
+    const torchLight = new THREE.PointLight(0xffa34a, 0, 2.7, 2);
+    torchLight.position.set(0.014, 0.46, 0.05);
+    torchGroup.add(torchLight);
+    perspCamera.add(torchGroup);
     
     scene.add(perspCamera); 
     perspCamera.add(weaponGroup);
@@ -332,6 +547,19 @@ export default function App() {
       opacity: 0.95,
       depthWrite: false,
     });
+    const grenadeGeo = new THREE.SphereGeometry(0.055, 10, 10);
+    const grenadeMaterial = new THREE.MeshStandardMaterial({
+      color: 0x4b5563,
+      roughness: 0.75,
+      metalness: 0.2,
+    });
+    const grenadeBurstGeo = new THREE.SphereGeometry(0.16, 12, 12);
+    const grenadeBurstMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffb020,
+      transparent: true,
+      opacity: 0.78,
+      depthWrite: false,
+    });
 
     const decalOuterMaterial = new THREE.MeshStandardMaterial({
       color: 0xd1d5db,
@@ -378,6 +606,126 @@ export default function App() {
           maxLife: 30 + Math.random() * 20
         });
       }
+    };
+
+    const getObstacleGap = (position: THREE.Vector3, radius: number) => {
+      let nearestGap = Number.POSITIVE_INFINITY;
+
+      for (const collider of obstacleCollidersRef.current) {
+        const inverseMatrix = collider.object.matrixWorld.clone().invert();
+        const localPoint = position.clone().applyMatrix4(inverseMatrix);
+
+        for (const shape of collider.shapes) {
+          if (shape.type === 'sphere') {
+            const gap = localPoint.distanceTo(shape.center) - (shape.radius + radius);
+            nearestGap = Math.min(nearestGap, gap);
+            continue;
+          }
+
+          const expandedHalfSize = shape.halfSize.clone().addScalar(radius);
+          const gap = getBoxSignedDistance(localPoint, shape.center, expandedHalfSize);
+          nearestGap = Math.min(nearestGap, gap);
+        }
+      }
+
+      return nearestGap;
+    };
+
+    const isObstacleBlocked = (position: THREE.Vector3, radius: number) => getObstacleGap(position, radius) < 0;
+
+    const resolveObstacleCollisions = (position: THREE.Vector3, radius: number) => {
+      const resolved = position.clone();
+
+      for (const collider of obstacleCollidersRef.current) {
+        const inverseMatrix = collider.object.matrixWorld.clone().invert();
+        let localPoint = resolved.clone().applyMatrix4(inverseMatrix);
+
+        for (const shape of collider.shapes) {
+          if (shape.type === 'sphere') {
+            const push = localPoint.clone().sub(shape.center);
+            const minDistance = radius + shape.radius;
+            const distanceSq = push.lengthSq();
+
+            if (distanceSq >= minDistance * minDistance) continue;
+
+            if (distanceSq < 1e-6) {
+              push.set(0, 1, 0);
+            } else {
+              push.normalize();
+            }
+
+            localPoint.copy(shape.center).add(push.multiplyScalar(minDistance));
+            continue;
+          }
+
+          const delta = localPoint.clone().sub(shape.center);
+          const expandedHalfSize = shape.halfSize.clone().addScalar(radius);
+          if (
+            Math.abs(delta.x) > expandedHalfSize.x ||
+            Math.abs(delta.y) > expandedHalfSize.y ||
+            Math.abs(delta.z) > expandedHalfSize.z
+          ) {
+            continue;
+          }
+
+          const overlapX = expandedHalfSize.x - Math.abs(delta.x);
+          const overlapY = expandedHalfSize.y - Math.abs(delta.y);
+          const overlapZ = expandedHalfSize.z - Math.abs(delta.z);
+
+          if (overlapX <= overlapY && overlapX <= overlapZ) {
+            delta.x = (delta.x >= 0 ? 1 : -1) * expandedHalfSize.x;
+          } else if (overlapY <= overlapX && overlapY <= overlapZ) {
+            delta.y = (delta.y >= 0 ? 1 : -1) * expandedHalfSize.y;
+          } else {
+            delta.z = (delta.z >= 0 ? 1 : -1) * expandedHalfSize.z;
+          }
+
+          localPoint.copy(shape.center).add(delta);
+        }
+
+        resolved.copy(localPoint.applyMatrix4(collider.object.matrixWorld));
+      }
+
+      return resolved;
+    };
+
+    const triggerGrenadeBurst = (position: THREE.Vector3) => {
+      const burst = new THREE.Mesh(grenadeBurstGeo, grenadeBurstMaterial.clone());
+      burst.position.copy(position);
+      scene.add(burst);
+      grenadeBurstsRef.current.push({
+        mesh: burst,
+        life: 0,
+        maxLife: 18,
+      });
+
+      spawnSmoke(position.clone(), 10, 0.05, 0.018);
+      recoilRef.current = Math.max(recoilRef.current, 0.45);
+    };
+
+    const throwGrenade = () => {
+      if (!fpsModeRef.current || !perspCameraRef.current || grenadeCooldownRef.current > 0) return;
+
+      const cam = perspCameraRef.current;
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion).normalize();
+      const up = characterPosRef.current.clone().normalize();
+      const grenade = new THREE.Mesh(grenadeGeo, grenadeMaterial.clone());
+
+      grenade.position
+        .copy(cam.position)
+        .add(forward.clone().multiplyScalar(0.34))
+        .add(right.clone().multiplyScalar(0.12))
+        .add(up.clone().multiplyScalar(-0.05));
+      scene.add(grenade);
+
+      grenadesRef.current.push({
+        mesh: grenade,
+        velocity: forward.multiplyScalar(0.18).add(up.multiplyScalar(0.09)).add(characterVelocityRef.current.clone().multiplyScalar(0.6)),
+        life: 0,
+      });
+
+      grenadeCooldownRef.current = GRENADE_THROW_COOLDOWN_FRAMES;
     };
 
     const clearAutoFire = () => {
@@ -538,14 +886,20 @@ export default function App() {
       }
     };
 
-    window.render_game_to_text = () => JSON.stringify({
+    window.render_game_to_text = () => {
+      const nearestObstacleGap = getObstacleGap(characterPosRef.current, PLAYER_COLLISION_RADIUS);
+
+      return JSON.stringify({
       mode: fpsModeRef.current ? 'fps' : flightModeRef.current ? 'flight' : 'orbit',
       weather: weatherRef.current,
       cameraView: cameraViewRef.current,
       pointerLocked: document.pointerLockElement === renderer.domElement,
       autoFireActive: autoFireIntervalRef.current !== null,
+      torchActive: torchActiveRef.current,
       shotsFired: shotsFiredRef.current,
       bulletTracers: bulletTracersRef.current.length,
+      grenades: grenadesRef.current.length,
+      grenadeBursts: grenadeBurstsRef.current.length,
       decals: decalsRef.current.length,
       smokeParticles: smokeParticlesRef.current.length,
       player: {
@@ -556,8 +910,10 @@ export default function App() {
         forwardX: Number(fpsForwardRef.current.x.toFixed(3)),
         forwardY: Number(fpsForwardRef.current.y.toFixed(3)),
         forwardZ: Number(fpsForwardRef.current.z.toFixed(3)),
+        nearestObstacleGap: Number(nearestObstacleGap.toFixed(3)),
       },
     });
+    };
 
     renderer.domElement.addEventListener('pointerdown', handleCanvasPointerDown);
     window.addEventListener('pointerup', handleShootRelease);
@@ -571,6 +927,7 @@ export default function App() {
     controls.rotateSpeed = 0.8;
     controls.minDistance = 7;
     controls.maxDistance = 25;
+    controls.target.set(0, 0, 0);
     controlsRef.current = controls;
 
     // --- Planet ---
@@ -727,6 +1084,7 @@ export default function App() {
     houseWindowMaterialRef.current = windowMatNight; // For any backward compatibility check, though not strictly needed anymore
 
     // Variables already defined above: sunDir
+    obstacleCollidersRef.current = [];
 
     const addTree = (pos: THREE.Vector3) => {
       // Adjust position to terrain height
@@ -757,6 +1115,13 @@ export default function App() {
       tree.position.copy(adjustedPos);
       tree.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), adjustedPos.clone().normalize());
       planetGroup.add(tree);
+      obstacleCollidersRef.current.push({
+        object: tree,
+        shapes: [
+          { type: 'sphere', center: new THREE.Vector3(0, 0.17, 0), radius: 0.16 },
+          { type: 'sphere', center: new THREE.Vector3(0, 0.4, 0), radius: 0.24 },
+        ],
+      });
     };
 
     const addHouse = (pos: THREE.Vector3) => {
@@ -814,6 +1179,13 @@ export default function App() {
       house.position.copy(adjustedPos);
       house.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), adjustedPos.clone().normalize());
       planetGroup.add(house);
+      obstacleCollidersRef.current.push({
+        object: house,
+        shapes: [
+          { type: 'box', center: new THREE.Vector3(0, 0.15, 0), halfSize: new THREE.Vector3(0.18, 0.18, 0.18) },
+          { type: 'sphere', center: new THREE.Vector3(0, 0.42, 0), radius: 0.27 },
+        ],
+      });
     };
 
     // Fibonacci Sphere placement for even distribution
@@ -1108,6 +1480,16 @@ export default function App() {
       // ============================================
       // 2. CAMERA LOGIC (priority: FPS > Flight > Orbit)
       // ============================================
+      const currentMode: 'orbit' | 'flight' | 'fps' = fpsModeRef.current
+        ? 'fps'
+        : flightModeRef.current
+          ? 'flight'
+          : 'orbit';
+      if (currentMode === 'orbit' && activeModeRef.current !== 'orbit') {
+        shouldResetOrbitCameraRef.current = true;
+      }
+      activeModeRef.current = currentMode;
+
       if (fpsModeRef.current) {
         // --- FPS MODE ---
         cameraRef.current = perspCameraRef.current;
@@ -1133,22 +1515,29 @@ export default function App() {
         if (keys['KeyA'] || keys['ArrowLeft']) moveDir.sub(surfaceRight);
         if (keys['KeyD'] || keys['ArrowRight']) moveDir.add(surfaceRight);
         
+        let weaponBaseY = -0.028;
+        let weaponBaseX = 0.1;
+
         if (moveDir.lengthSq() > 0) {
           moveDir.normalize().multiplyScalar(0.08);
-          characterPosRef.current.add(moveDir);
+          characterPosRef.current.copy(
+            resolveObstacleCollisions(
+              characterPosRef.current.clone().add(moveDir),
+              PLAYER_COLLISION_RADIUS
+            )
+          );
           
           // Weapon walk sway
           if (weaponGroupRef.current) {
             const time = Date.now() * 0.008;
-            weaponGroupRef.current.position.y = -0.06 + Math.sin(time) * 0.003;
-            weaponGroupRef.current.position.x = 0.08 + Math.cos(time * 0.5) * 0.003;
+            weaponBaseY += Math.sin(time) * 0.003;
+            weaponBaseX += Math.cos(time * 0.5) * 0.003;
           }
         } else {
           // Idle sway
           if (weaponGroupRef.current) {
             const time = Date.now() * 0.002;
-            weaponGroupRef.current.position.y = -0.06 + Math.sin(time) * 0.001;
-            weaponGroupRef.current.position.x = 0.08;
+            weaponBaseY += Math.sin(time) * 0.001;
           }
         }
 
@@ -1174,6 +1563,16 @@ export default function App() {
           }
         }
 
+        characterPosRef.current.copy(
+          resolveObstacleCollisions(characterPosRef.current, PLAYER_COLLISION_RADIUS)
+        );
+        const obstacleResolvedUp = characterPosRef.current.clone().normalize();
+        const obstacleResolvedTerrain = getTerrainHeight(obstacleResolvedUp);
+        const obstacleResolvedRadius = PLANET_RADIUS + obstacleResolvedTerrain + 0.15;
+        if (characterPosRef.current.length() < obstacleResolvedRadius) {
+          characterPosRef.current.setLength(obstacleResolvedRadius);
+        }
+
         // Camera at eye level
         if (weaponGroupRef.current) weaponGroupRef.current.visible = true;
         cameraRef.current.position.copy(characterPosRef.current);
@@ -1188,9 +1587,133 @@ export default function App() {
         cameraRef.current.lookAt(cameraRef.current.position.clone().add(lookDirection));
         characterQuatRef.current.copy(cameraRef.current.quaternion);
 
+        const lookDownFactor = THREE.MathUtils.smoothstep(-lookDirection.dot(groundedUp), 0.1, 0.95);
+        weaponGroundAvoidanceRef.current = lookDownFactor;
+        if (weaponGroupRef.current) {
+          weaponGroupRef.current.position.x = weaponBaseX;
+          weaponGroupRef.current.position.y = weaponBaseY + lookDownFactor * 0.004;
+          weaponGroupRef.current.position.z = lookDownFactor * 0.0015;
+        }
+
+        const isNightSide = groundedUp.dot(sunDir) < -0.08;
+        torchActiveRef.current = isNightSide;
+        torchGroup.visible = isNightSide;
+        if (isNightSide) {
+          const torchTime = performance.now() * 0.0035;
+          const flicker = 0.92 + Math.sin(torchTime * 8.1) * 0.1 + Math.sin(torchTime * 14.4) * 0.05;
+          const flameLean = Math.sin(torchTime * 1.8) * 0.014;
+          const torchLookLift = lookDownFactor * 0.18;
+          const torchLookPull = lookDownFactor * 0.03;
+          const torchCounterTilt = lookDownFactor * 0.28;
+
+          torchFlameCore.scale.set(0.46 + flicker * 0.1, 0.86 + flicker * 0.22, 0.46 + flicker * 0.1);
+          (torchFlameCore.material as THREE.MeshBasicMaterial).opacity = 0.24 + flicker * 0.12;
+          torchFlameHalo.scale.set(0.16 + flicker * 0.035, 0.34 + flicker * 0.08, 1);
+          (torchFlameHalo.material as THREE.SpriteMaterial).opacity = 0.2 + flicker * 0.07;
+          torchLight.intensity = 1.35 + flicker * 0.68;
+          torchLight.distance = 2.55 + flicker * 0.28;
+          torchLight.position.set(
+            0.014,
+            0.46 + lookDownFactor * 0.12,
+            0.05 - lookDownFactor * 0.01
+          );
+          torchGroup.position.set(
+            -0.3 + Math.cos(torchTime * 1.05) * 0.004,
+            -0.3 + torchLookLift + Math.sin(torchTime * 1.2) * 0.004,
+            -0.39 + torchLookPull + Math.sin(torchTime * 0.9) * 0.006
+          );
+          torchGroup.rotation.set(
+            0.18 - torchCounterTilt + Math.sin(torchTime * 1.2) * 0.01,
+            0.08 + Math.cos(torchTime * 1.35) * 0.01,
+            0.1 - lookDownFactor * 0.03 + Math.sin(torchTime * 1.05) * 0.012
+          );
+
+          for (let index = 0; index < outerFlameParticleCount; index += 1) {
+            const particleIndex = index * 3;
+            const phase = torchTime * 0.88 + index * 0.17;
+            const life = phase % 1;
+            const seed = outerFlameSeeds[index];
+            const radius = (0.036 + seed * 0.018) * (1 - life) + 0.01;
+            outerFlamePositions[particleIndex] =
+              0.014
+              + flameLean * life * (1.35 + seed * 0.8)
+              + Math.sin(phase * (7.6 + seed * 4.2) + seed * Math.PI * 2) * radius * 0.62;
+            outerFlamePositions[particleIndex + 1] = 0.38 + life * (0.22 + seed * 0.12);
+            outerFlamePositions[particleIndex + 2] =
+              0.004 + Math.cos(phase * (5.1 + seed * 2.8) + seed * 3.4) * radius * 0.18;
+
+            outerFlameColors[particleIndex] = 1;
+            outerFlameColors[particleIndex + 1] = 0.52 + (1 - life) * 0.34;
+            outerFlameColors[particleIndex + 2] = 0.05 + (1 - life) * 0.1;
+          }
+
+          for (let index = 0; index < innerFlameParticleCount; index += 1) {
+            const particleIndex = index * 3;
+            const phase = torchTime * 1.1 + index * 0.27;
+            const life = phase % 1;
+            const seed = innerFlameSeeds[index];
+            const radius = (0.015 + seed * 0.01) * (1 - life) + 0.004;
+            innerFlamePositions[particleIndex] =
+              0.014
+              + flameLean * life * (0.9 + seed * 0.35)
+              + Math.sin(phase * (8.4 + seed * 5.1) + seed * 5.6) * radius * 0.48;
+            innerFlamePositions[particleIndex + 1] = 0.41 + life * (0.18 + seed * 0.08);
+            innerFlamePositions[particleIndex + 2] =
+              0.006 + Math.cos(phase * (6.2 + seed * 2.7) + seed * 2.4) * radius * 0.12;
+
+            innerFlameColors[particleIndex] = 1;
+            innerFlameColors[particleIndex + 1] = 0.92 - life * 0.1;
+            innerFlameColors[particleIndex + 2] = 0.46 - life * 0.24;
+          }
+
+          for (let index = 0; index < smokeParticleCount; index += 1) {
+            const particleIndex = index * 3;
+            const phase = torchTime * 0.3 + index * 0.22;
+            const life = phase % 1;
+            const seed = smokeSeeds[index];
+            const drift = 0.018 + life * (0.04 + seed * 0.03);
+            smokePositions[particleIndex] =
+              0.014
+              + flameLean * life * (2.2 + seed)
+              + Math.sin(phase * (4.1 + seed * 1.8) + seed * 4.7) * drift * 0.9;
+            smokePositions[particleIndex + 1] = 0.58 + life * (0.18 + seed * 0.12);
+            smokePositions[particleIndex + 2] =
+              0.01 + Math.cos(phase * (3.2 + seed * 1.4) + seed * 3.9) * drift * 0.2;
+
+            const smokeShade = 0.24 + (1 - life) * 0.22;
+            smokeColors[particleIndex] = smokeShade;
+            smokeColors[particleIndex + 1] = smokeShade * 0.92;
+            smokeColors[particleIndex + 2] = smokeShade * 0.88;
+          }
+
+          (outerFlameGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+          (outerFlameGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+          (innerFlameGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+          (innerFlameGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+          (smokeGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+          (smokeGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+        } else {
+          torchLight.intensity = 0;
+          torchFlameCore.scale.setScalar(0.45);
+          (torchFlameCore.material as THREE.MeshBasicMaterial).opacity = 0.12;
+          (torchFlameHalo.material as THREE.SpriteMaterial).opacity = 0.08;
+        }
+
+        if (grenadeCooldownRef.current > 0) {
+          grenadeCooldownRef.current -= 1;
+        }
+        if (grenadeThrowRequestedRef.current) {
+          throwGrenade();
+          grenadeThrowRequestedRef.current = false;
+        }
+
       } else if (flightModeRef.current) {
         // --- FLIGHT MODE CAMERA ---
         controls.enabled = false;
+        weaponGroundAvoidanceRef.current = 0;
+        torchActiveRef.current = false;
+        torchGroup.visible = false;
+        torchLight.intensity = 0;
 
         if (cameraViewRef.current === 'cockpit') {
           cameraRef.current = perspCameraRef.current;
@@ -1237,6 +1760,10 @@ export default function App() {
         cameraRef.current = orthoCameraRef.current;
         if (!cameraRef.current) return;
         const ortho = cameraRef.current as THREE.OrthographicCamera;
+        weaponGroundAvoidanceRef.current = 0;
+        torchActiveRef.current = false;
+        torchGroup.visible = false;
+        torchLight.intensity = 0;
 
         // Reset zoom smoothly
         if (ortho.zoom !== 1.0) {
@@ -1245,14 +1772,27 @@ export default function App() {
           ortho.updateProjectionMatrix();
         }
 
-        // Reset camera position smoothly to initial position
-        const initialPos = new THREE.Vector3(0, 6, 18);
-        cameraRef.current.position.lerp(initialPos, 0.05);
-
-        // Smoothly revert camera UP to world UP
-        cameraRef.current.up.lerp(new THREE.Vector3(0, 1, 0), 0.1);
-
         controls.enabled = true;
+
+        if (shouldResetOrbitCameraRef.current) {
+          const initialPos = new THREE.Vector3(0, 6, 18);
+          const worldUp = new THREE.Vector3(0, 1, 0);
+          cameraRef.current.position.lerp(initialPos, 0.12);
+          cameraRef.current.up.lerp(worldUp, 0.12);
+          controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.12);
+
+          if (
+            cameraRef.current.position.distanceToSquared(initialPos) < 0.0025 &&
+            cameraRef.current.up.distanceToSquared(worldUp) < 0.0004 &&
+            controls.target.lengthSq() < 0.0025
+          ) {
+            cameraRef.current.position.copy(initialPos);
+            cameraRef.current.up.copy(worldUp);
+            controls.target.set(0, 0, 0);
+            shouldResetOrbitCameraRef.current = false;
+          }
+        }
+
         controls.update();
 
         // Hide weapon
@@ -1398,6 +1938,62 @@ export default function App() {
         }
       }
 
+      // Grenades
+      for (let i = grenadesRef.current.length - 1; i >= 0; i--) {
+        const grenade = grenadesRef.current[i];
+        grenade.life++;
+
+        const grenadeUp = grenade.mesh.position.clone().normalize();
+        grenade.velocity.add(grenadeUp.multiplyScalar(-0.0045));
+        grenade.mesh.position.add(grenade.velocity);
+        grenade.mesh.rotation.x += 0.18;
+        grenade.mesh.rotation.z += 0.24;
+
+        const surfaceUp = grenade.mesh.position.clone().normalize();
+        const surfaceRadius = PLANET_RADIUS + getTerrainHeight(surfaceUp) + 0.05;
+        const groundHit = grenade.mesh.position.length() <= surfaceRadius;
+        const obstacleHit = isObstacleBlocked(grenade.mesh.position, 0.07);
+
+        if (groundHit) {
+          grenade.mesh.position.setLength(surfaceRadius);
+        }
+
+        if ((grenade.life > GRENADE_ARM_FRAMES && (groundHit || obstacleHit)) || grenade.life >= GRENADE_FUSE_FRAMES) {
+          triggerGrenadeBurst(grenade.mesh.position.clone());
+          scene.remove(grenade.mesh);
+          grenade.mesh.geometry.dispose();
+          (grenade.mesh.material as THREE.Material).dispose();
+          grenadesRef.current.splice(i, 1);
+          continue;
+        }
+
+        if (groundHit) {
+          const normal = grenade.mesh.position.clone().normalize();
+          const verticalVelocity = grenade.velocity.dot(normal);
+          if (verticalVelocity < 0) {
+            grenade.velocity.addScaledVector(normal, -1.55 * verticalVelocity);
+            grenade.velocity.multiplyScalar(0.72);
+          }
+        }
+      }
+
+      // Grenade explosion bursts
+      for (let i = grenadeBurstsRef.current.length - 1; i >= 0; i--) {
+        const burst = grenadeBurstsRef.current[i];
+        burst.life++;
+        const t = burst.life / burst.maxLife;
+        const scale = 1 + t * 4.5;
+        burst.mesh.scale.set(scale, scale, scale);
+        (burst.mesh.material as THREE.MeshBasicMaterial).opacity = 0.78 * (1 - t);
+
+        if (burst.life >= burst.maxLife) {
+          scene.remove(burst.mesh);
+          burst.mesh.geometry.dispose();
+          (burst.mesh.material as THREE.Material).dispose();
+          grenadeBurstsRef.current.splice(i, 1);
+        }
+      }
+
       // Muzzle flash decay
       if (muzzleFlashRef.current && muzzleFlashRef.current.intensity > 0) {
         muzzleFlashRef.current.intensity *= 0.7;
@@ -1407,9 +2003,9 @@ export default function App() {
       // Weapon recoil recovery
       if (recoilRef.current > 0.01 && weaponGroupRef.current) {
         recoilRef.current *= 0.85;
-        weaponGroupRef.current.rotation.x = -recoilRef.current * 0.15;
+        weaponGroupRef.current.rotation.x = weaponGroundAvoidanceRef.current * 0.5 - recoilRef.current * 0.15;
       } else if (weaponGroupRef.current) {
-        weaponGroupRef.current.rotation.x = 0;
+        weaponGroupRef.current.rotation.x = weaponGroundAvoidanceRef.current * 0.5;
         recoilRef.current = 0;
       }
 
@@ -1444,6 +2040,18 @@ export default function App() {
         (tracer.mesh.material as THREE.Material).dispose();
       });
       bulletTracersRef.current = [];
+      grenadesRef.current.forEach(grenade => {
+        scene.remove(grenade.mesh);
+        grenade.mesh.geometry.dispose();
+        (grenade.mesh.material as THREE.Material).dispose();
+      });
+      grenadesRef.current = [];
+      grenadeBurstsRef.current.forEach(burst => {
+        scene.remove(burst.mesh);
+        burst.mesh.geometry.dispose();
+        (burst.mesh.material as THREE.Material).dispose();
+      });
+      grenadeBurstsRef.current = [];
       decalsRef.current.forEach(d => {
         scene.remove(d);
         disposeSceneObject(d);
@@ -1882,6 +2490,8 @@ export default function App() {
                         <div className="text-left py-1">Look Around</div>
                         <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">SPACE</div>
                         <div className="text-left py-1">Jump</div>
+                        <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">G</div>
+                        <div className="text-left py-1">Throw Grenade</div>
                         <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">CLICK</div>
                         <div className="text-left py-1">Lock Cursor / Single Shot</div>
                         <div className="text-right font-mono text-amber-400 bg-white/5 px-2 py-1 rounded">HOLD CLICK</div>
